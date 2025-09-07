@@ -6,9 +6,9 @@
 """
 Biblioteca Gráfica / Graphics Library.
 
-Desenvolvido por: <SEU NOME AQUI>
+Desenvolvido por: João Pedro Rodrigues dos Santos
 Disciplina: Computação Gráfica
-Data: <DATA DE INÍCIO DA IMPLEMENTAÇÃO>
+Data: 2025-08-17
 """
 
 import time         # Para operações com tempo
@@ -19,20 +19,31 @@ import numpy as np  # Biblioteca do Numpy
 class GL:
     """Classe que representa a biblioteca gráfica (Graphics Library)."""
 
-    width = 800   # largura da tela
-    height = 600  # altura da tela
-    near = 0.01   # plano de corte próximo
-    far = 1000    # plano de corte distante
+    width = 1280
+    height = 720
+    near = 0.01
+    far = 1000
+    
+    # Matrizes para pipeline 3D
+    model_matrix = np.eye(4)
+    view_matrix = np.eye(4)
+    projection_matrix = np.eye(4)
+    transform_stack = []
+    
+    # Dados da câmera
+    camera_position = [0, 0, 0]
+    camera_orientation = [0, 0, 1, 0]
+    camera_fov = math.pi/4
 
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
-        """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
+        """Definir parâmetros para câmera de razão de aspecto, plano próximo e distante."""
         GL.width = width
         GL.height = height
         GL.near = near
         GL.far = far
 
-    # ---------- utilidades internas ----------
+    # ---------- Funções de utilidade ----------
     @staticmethod
     def _rgb8(c):
         r, g, b = c if c else (1.0, 1.0, 1.0)
@@ -48,6 +59,238 @@ class GL:
     def _put(u, v, col):
         if GL._in_bounds(u, v):
             gpu.GPU.draw_pixel([u, v], gpu.GPU.RGB8, col)
+
+    @staticmethod
+    def _edge(ax, ay, bx, by, px, py):
+        return (px-ax)*(by-ay) - (py-ay)*(bx-ax)
+
+    @staticmethod
+    def _create_rotation_matrix(axis, angle):
+        """Cria matriz de rotação usando fórmula de Rodrigues."""
+        if np.linalg.norm(axis) == 0:
+            return np.eye(4)
+            
+        axis = np.array(axis) / np.linalg.norm(axis)
+        c = np.cos(angle)
+        s = np.sin(angle)
+        
+        R = np.eye(4)
+        R[:3,:3] = np.array([
+            [c + axis[0]**2*(1-c), axis[0]*axis[1]*(1-c) - axis[2]*s, axis[0]*axis[2]*(1-c) + axis[1]*s],
+            [axis[1]*axis[0]*(1-c) + axis[2]*s, c + axis[1]**2*(1-c), axis[1]*axis[2]*(1-c) - axis[0]*s],
+            [axis[2]*axis[0]*(1-c) - axis[1]*s, axis[2]*axis[1]*(1-c) + axis[0]*s, c + axis[2]**2*(1-c)]
+        ])
+        return R
+
+    @staticmethod
+    def _create_perspective_matrix(fov, aspect, near, far):
+        """Cria matriz de projeção perspectiva."""
+        f = 1.0 / np.tan(fov / 2.0)
+        P = np.zeros((4, 4))
+        P[0,0] = f / aspect
+        P[1,1] = f
+        P[2,2] = (far + near) / (near - far)
+        P[2,3] = (2 * far * near) / (near - far)
+        P[3,2] = -1
+        return P
+
+    @staticmethod
+    def _create_view_matrix(position, orientation):
+        """Cria matriz de visualização da câmera."""
+        # Posição da câmera
+        eye = np.array(position)
+        
+        # Vetor de direção baseado na orientação
+        axis = np.array(orientation[:3])
+        angle = orientation[3]
+        
+        # Direção inicial (olhando para -Z)
+        forward = np.array([0, 0, -1])
+        up = np.array([0, 1, 0])
+        
+        # Aplica rotação da câmera
+        if np.linalg.norm(axis) > 0:
+            R = GL._create_rotation_matrix(axis, angle)
+            forward = (R[:3,:3] @ forward)
+            up = (R[:3,:3] @ up)
+        
+        # Calcula vetores da câmera
+        target = eye + forward
+        
+        # Constrói matriz de visualização (lookAt)
+        f = (target - eye) / np.linalg.norm(target - eye)
+        s = np.cross(f, up) / np.linalg.norm(np.cross(f, up))
+        u = np.cross(s, f)
+        
+        view = np.eye(4)
+        view[:3,0] = s
+        view[:3,1] = u
+        view[:3,2] = -f
+        view[0,3] = -np.dot(s, eye)
+        view[1,3] = -np.dot(u, eye)
+        view[2,3] = np.dot(f, eye)
+        
+        return view
+
+    @staticmethod
+    def _project_vertex(vertex):
+        """Aplica pipeline completo de transformação 3D."""
+        # Aplica transformações do modelo
+        v_world = GL.model_matrix @ vertex
+        
+        # Aplica transformação da câmera
+        v_view = GL.view_matrix @ v_world
+        
+        # Aplica projeção perspectiva
+        v_clip = GL.projection_matrix @ v_view
+        
+        # Divisão perspectiva
+        if v_clip[3] != 0:
+            v_ndc = v_clip / v_clip[3]
+        else:
+            v_ndc = v_clip
+        
+        # Transformação para coordenadas de tela
+        x_screen = (v_ndc[0] + 1) * GL.width / 2
+        y_screen = (1 - v_ndc[1]) * GL.height / 2
+        
+        return x_screen, y_screen, v_ndc[2]
+
+    @staticmethod
+    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color):
+        """Rasteriza um triângulo com test de profundidade simples."""
+        # Converte para inteiros
+        x0, y0 = int(round(x0)), int(round(y0))
+        x1, y1 = int(round(x1)), int(round(y1))
+        x2, y2 = int(round(x2)), int(round(y2))
+        
+        # Bounding box
+        minx = max(min(x0, x1, x2), 0)
+        maxx = min(max(x0, x1, x2), GL.width-1)
+        miny = max(min(y0, y1, y2), 0)
+        maxy = min(max(y0, y1, y2), GL.height-1)
+        
+        # Área do triângulo
+        area = GL._edge(x0, y0, x1, y1, x2, y2)
+        if area == 0:
+            return
+        
+        # Rasterização
+        for y in range(miny, maxy+1):
+            for x in range(minx, maxx+1):
+                w0 = GL._edge(x1, y1, x2, y2, x, y)
+                w1 = GL._edge(x2, y2, x0, y0, x, y)
+                w2 = GL._edge(x0, y0, x1, y1, x, y)
+                
+                # Teste de dentro do triângulo
+                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, color)
+
+    # ---------- Implementações principais ----------
+    
+    @staticmethod
+    def triangleSet(point, colors):
+        """Função usada para renderizar TriangleSet 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Processa triângulos (cada 9 valores = 3 vértices de 3 coordenadas)
+        for t in range(0, len(point), 9):
+            # Vértices do triângulo
+            v0 = np.array([point[t], point[t+1], point[t+2], 1.0])
+            v1 = np.array([point[t+3], point[t+4], point[t+5], 1.0])
+            v2 = np.array([point[t+6], point[t+7], point[t+8], 1.0])
+            
+            # Projeta vértices
+            x0, y0, z0 = GL._project_vertex(v0)
+            x1, y1, z1 = GL._project_vertex(v1)
+            x2, y2, z2 = GL._project_vertex(v2)
+            
+            # Verifica se está dentro do volume de visualização
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+
+    @staticmethod
+    def viewpoint(position, orientation, fieldOfView):
+        """Função usada para configurar o viewpoint (câmera)."""
+        print(f"DEBUG Viewpoint: position={position}, orientation={orientation}, fov={fieldOfView}")
+        
+        GL.camera_position = position
+        GL.camera_orientation = orientation
+        GL.camera_fov = fieldOfView
+        
+        # Atualiza matriz de visualização
+        GL.view_matrix = GL._create_view_matrix(position, orientation)
+        
+        # Atualiza matriz de projeção
+        aspect = GL.width / GL.height
+        GL.projection_matrix = GL._create_perspective_matrix(fieldOfView, aspect, GL.near, GL.far)
+        
+        print(f"DEBUG View matrix:\n{GL.view_matrix}")
+        print(f"DEBUG Projection matrix:\n{GL.projection_matrix}")
+
+    @staticmethod
+    def transform_in(translation, scale, rotation):
+        """Função usada para aplicar transformações hierárquicas."""
+        # Salva estado atual na pilha
+        GL.transform_stack.append(GL.model_matrix.copy())
+        
+        # Cria matrizes de transformação
+        T = np.eye(4)  # Translação
+        R = np.eye(4)  # Rotação
+        S = np.eye(4)  # Escala
+        
+        # Matriz de escala
+        if scale:
+            S[0,0] = scale[0]
+            S[1,1] = scale[1]
+            S[2,2] = scale[2]
+        
+        # Matriz de rotação
+        if rotation and len(rotation) == 4:
+            axis = rotation[:3]
+            angle = rotation[3]
+            R = GL._create_rotation_matrix(axis, angle)
+        
+        # Matriz de translação
+        if translation:
+            T[0,3] = translation[0]
+            T[1,3] = translation[1]
+            T[2,3] = translation[2]
+        
+        # Combina transformações: T * R * S (ordem importante!)
+        transform = T @ R @ S
+        GL.model_matrix = GL.model_matrix @ transform
+
+    @staticmethod
+    def transform_out():
+        """Função usada para sair de uma transformação hierárquica."""
+        # Restaura estado anterior da pilha
+        if GL.transform_stack:
+            GL.model_matrix = GL.transform_stack.pop()
+        else:
+            GL.model_matrix = np.eye(4)
+
+    # ---------- Implementações 2D existentes ----------
+    
+    @staticmethod
+    def polypoint2D(point, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        for i in range(0, len(point), 2):
+            u = int(round(point[i]))
+            v = int(round(point[i+1]))
+            GL._put(u, v, col)
+
+    @staticmethod
+    def polyline2D(lineSegments, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        if len(lineSegments) < 4:
+            return
+        for i in range(0, len(lineSegments)-2, 2):
+            x0, y0 = lineSegments[i], lineSegments[i+1]
+            x1, y1 = lineSegments[i+2], lineSegments[i+3]
+            GL._bresenham(x0, y0, x1, y1, col)
 
     @staticmethod
     def _bresenham(x0, y0, x1, y1, col):
@@ -69,35 +312,10 @@ class GL:
                 y0 += sy
 
     @staticmethod
-    def _edge(ax, ay, bx, by, px, py):
-        return (px-ax)*(by-ay) - (py-ay)*(bx-ax)
-
-    # ---------- 1) pontos ----------
-    @staticmethod
-    def polypoint2D(point, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
-        for i in range(0, len(point), 2):
-            u = int(round(point[i]))
-            v = int(round(point[i+1]))
-            GL._put(u, v, col)
-
-    # ---------- 2) linhas ----------
-    @staticmethod
-    def polyline2D(lineSegments, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
-        if len(lineSegments) < 4:
-            return
-        for i in range(0, len(lineSegments)-2, 2):
-            x0, y0 = lineSegments[i],   lineSegments[i+1]
-            x1, y1 = lineSegments[i+2], lineSegments[i+3]
-            GL._bresenham(x0, y0, x1, y1, col)
-
-    # (extra) círculo 2D — contorno
-    @staticmethod
     def circle2D(radius, colors):
         col = GL._rgb8(colors.get("emissiveColor"))
-        cx, cy = 0.0, 0.0  # círculo é centrado na origem em 2D
-        step = 1  # graus
+        cx, cy = 0.0, 0.0
+        step = 1
         x_prev = cx + radius * math.sin(math.radians(0))
         y_prev = cy + radius * math.cos(math.radians(0))
         for deg in range(step, 360+step, step):
@@ -106,12 +324,11 @@ class GL:
             GL._bresenham(x_prev, y_prev, x, y, col)
             x_prev, y_prev = x, y
 
-    # ---------- 3) triângulos ----------
     @staticmethod
     def triangleSet2D(vertices, colors):
         col = GL._rgb8(colors.get("emissiveColor"))
         for t in range(0, len(vertices), 6):
-            x0, y0 = vertices[t],   vertices[t+1]
+            x0, y0 = vertices[t], vertices[t+1]
             x1, y1 = vertices[t+2], vertices[t+3]
             x2, y2 = vertices[t+4], vertices[t+5]
 
@@ -133,372 +350,459 @@ class GL:
                     w0 = GL._edge(X1, Y1, X2, Y2, x, y)
                     w1 = GL._edge(X2, Y2, X0, Y0, x, y)
                     w2 = GL._edge(X0, Y0, X1, Y1, x, y)
-                    # aceita orientação positiva ou negativa (regra top-left simplificada)
                     if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
                         gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
 
-    @staticmethod
-    def triangleSet(point, colors):
-        """Função usada para renderizar TriangleSet."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleSet
-        # Nessa função você receberá pontos no parâmetro point, esses pontos são uma lista
-        # de pontos x, y, e z sempre na ordem. Assim point[0] é o valor da coordenada x do
-        # primeiro ponto, point[1] o valor y do primeiro ponto, point[2] o valor z da
-        # coordenada z do primeiro ponto. Já point[3] é a coordenada x do segundo ponto e
-        # assim por diante.
-        # No TriangleSet os triângulos são informados individualmente, assim os três
-        # primeiros pontos definem um triângulo, os três próximos pontos definem um novo
-        # triângulo, e assim por diante.
-        # O parâmetro colors é um dicionário com os tipos cores possíveis, você pode assumir
-        # inicialmente, para o TriangleSet, o desenho das linhas com a cor emissiva
-        # (emissiveColor), conforme implementar novos materias você deverá suportar outros
-        # tipos de cores.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
-
-    @staticmethod
-    def viewpoint(position, orientation, fieldOfView):
-        """Função usada para renderizar (na verdade coletar os dados) de Viewpoint."""
-        # Na função de viewpoint você receberá a posição, orientação e campo de visão da
-        # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
-        # perspectiva para poder aplicar nos pontos dos objetos geométricos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
-
-    @staticmethod
-    def transform_in(translation, scale, rotation):
-        """Função usada para renderizar (na verdade coletar os dados) de Transform."""
-        # A função transform_in será chamada quando se entrar em um nó X3D do tipo Transform
-        # do grafo de cena. Os valores passados são a escala em um vetor [x, y, z]
-        # indicando a escala em cada direção, a translação [x, y, z] nas respectivas
-        # coordenadas e finalmente a rotação por [x, y, z, t] sendo definida pela rotação
-        # do objeto ao redor do eixo x, y, z por t radianos, seguindo a regra da mão direita.
-        # Quando se entrar em um nó transform se deverá salvar a matriz de transformação dos
-        # modelos do mundo para depois potencialmente usar em outras chamadas. 
-        # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
-        # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Transform : ", end='')
-        if translation:
-            print("translation = {0} ".format(translation), end='') # imprime no terminal
-        if scale:
-            print("scale = {0} ".format(scale), end='') # imprime no terminal
-        if rotation:
-            print("rotation = {0} ".format(rotation), end='') # imprime no terminal
-        print("")
-
-    @staticmethod
-    def transform_out():
-        """Função usada para renderizar (na verdade coletar os dados) de Transform."""
-        # A função transform_out será chamada quando se sair em um nó X3D do tipo Transform do
-        # grafo de cena. Não são passados valores, porém quando se sai de um nó transform se
-        # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
-        # pilha implementada.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
-
+    # ---------- Funções não implementadas (stubs) ----------
+    
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
-        """Função usada para renderizar TriangleStripSet."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#TriangleStripSet
-        # A função triangleStripSet é usada para desenhar tiras de triângulos interconectados,
-        # você receberá as coordenadas dos pontos no parâmetro point, esses pontos são uma
-        # lista de pontos x, y, e z sempre na ordem. Assim point[0] é o valor da coordenada x
-        # do primeiro ponto, point[1] o valor y do primeiro ponto, point[2] o valor z da
-        # coordenada z do primeiro ponto. Já point[3] é a coordenada x do segundo ponto e assim
-        # por diante. No TriangleStripSet a quantidade de vértices a serem usados é informado
-        # em uma lista chamada stripCount (perceba que é uma lista). Ligue os vértices na ordem,
-        # primeiro triângulo será com os vértices 0, 1 e 2, depois serão os vértices 1, 2 e 3,
-        # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
-        # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleStripSet : pontos = {0} ".format(point), end='')
-        for i, strip in enumerate(stripCount):
-            print("strip[{0}] = {1} ".format(i, strip), end='')
-        print("")
-        print("TriangleStripSet : colors = {0}".format(colors)) # imprime no terminal as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
-
+        print("TriangleStripSet não implementado ainda")
+        
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
-        """Função usada para renderizar IndexedTriangleStripSet."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/rendering.html#IndexedTriangleStripSet
-        # A função indexedTriangleStripSet é usada para desenhar tiras de triângulos
-        # interconectados, você receberá as coordenadas dos pontos no parâmetro point, esses
-        # pontos são uma lista de pontos x, y, e z sempre na ordem. Assim point[0] é o valor
-        # da coordenada x do primeiro ponto, point[1] o valor y do primeiro ponto, point[2]
-        # o valor z da coordenada z do primeiro ponto. Já point[3] é a coordenada x do
-        # segundo ponto e assim por diante. No IndexedTriangleStripSet uma lista informando
-        # como conectar os vértices é informada em index, o valor -1 indica que a lista
-        # acabou. A ordem de conexão será de 3 em 3 pulando um índice. Por exemplo: o
-        # primeiro triângulo será com os vértices 0, 1 e 2, depois serão os vértices 1, 2 e 3,
-        # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
-        # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
-        print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
-
+        print("IndexedTriangleStripSet não implementado ainda")
+        
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
                        texCoord, texCoordIndex, colors, current_texture):
-        """Função usada para renderizar IndexedFaceSet."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#IndexedFaceSet
-        # A função indexedFaceSet é usada para desenhar malhas de triângulos. Ela funciona de
-        # forma muito simular a IndexedTriangleStripSet porém com mais recursos.
-        # Você receberá as coordenadas dos pontos no parâmetro cord, esses
-        # pontos são uma lista de pontos x, y, e z sempre na ordem. Assim coord[0] é o valor
-        # da coordenada x do primeiro ponto, coord[1] o valor y do primeiro ponto, coord[2]
-        # o valor z da coordenada z do primeiro ponto. Já coord[3] é a coordenada x do
-        # segundo ponto e assim por diante. No IndexedFaceSet uma lista de vértices é informada
-        # em coordIndex, o valor -1 indica que a lista acabou.
-        # A ordem de conexão não possui uma ordem oficial, mas em geral se o primeiro ponto com os dois
-        # seguintes e depois este mesmo primeiro ponto com o terçeiro e quarto ponto. Por exemplo: numa
-        # sequencia 0, 1, 2, 3, 4, -1 o primeiro triângulo será com os vértices 0, 1 e 2, depois serão
-        # os vértices 0, 2 e 3, e depois 0, 3 e 4, e assim por diante, até chegar no final da lista.
-        # Adicionalmente essa implementação do IndexedFace aceita cores por vértices, assim
-        # se a flag colorPerVertex estiver habilitada, os vértices também possuirão cores
-        # que servem para definir a cor interna dos poligonos, para isso faça um cálculo
-        # baricêntrico de que cor deverá ter aquela posição. Da mesma forma se pode definir uma
-        # textura para o poligono, para isso, use as coordenadas de textura e depois aplique a
-        # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
-        # implementadado um método para a leitura de imagens.
-
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))  # imprime no terminal as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
-
+        print("IndexedFaceSet não implementado ainda")
+        
     @staticmethod
     def box(size, colors):
-        """Função usada para renderizar Boxes."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#Box
-        # A função box é usada para desenhar paralelepípedos na cena. O Box é centrada no
-        # (0, 0, 0) no sistema de coordenadas local e alinhado com os eixos de coordenadas
-        # locais. O argumento size especifica as extensões da caixa ao longo dos eixos X, Y
-        # e Z, respectivamente, e cada valor do tamanho deve ser maior que zero. Para desenha
-        # essa caixa você vai provavelmente querer tesselar ela em triângulos, para isso
-        # encontre os vértices e defina os triângulos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Box : size = {0}".format(size)) # imprime no terminal pontos
-        print("Box : colors = {0}".format(colors)) # imprime no terminal as cores
-
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
-
+        print("Box não implementado ainda")
+        
     @staticmethod
     def sphere(radius, colors):
-        """Função usada para renderizar Esferas."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#Sphere
-        # A função sphere é usada para desenhar esferas na cena. O esfera é centrada no
-        # (0, 0, 0) no sistema de coordenadas local. O argumento radius especifica o
-        # raio da esfera que está sendo criada. Para desenha essa esfera você vai
-        # precisar tesselar ela em triângulos, para isso encontre os vértices e defina
-        # os triângulos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Sphere : radius = {0}".format(radius)) # imprime no terminal o raio da esfera
-        print("Sphere : colors = {0}".format(colors)) # imprime no terminal as cores
-
+        print("Sphere não implementado ainda")
+        
     @staticmethod
     def cone(bottomRadius, height, colors):
-        """Função usada para renderizar Cones."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#Cone
-        # A função cone é usada para desenhar cones na cena. O cone é centrado no
-        # (0, 0, 0) no sistema de coordenadas local. O argumento bottomRadius especifica o
-        # raio da base do cone e o argumento height especifica a altura do cone.
-        # O cone é alinhado com o eixo Y local. O cone é fechado por padrão na base.
-        # Para desenha esse cone você vai precisar tesselar ele em triângulos, para isso
-        # encontre os vértices e defina os triângulos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cone : bottomRadius = {0}".format(bottomRadius)) # imprime no terminal o raio da base do cone
-        print("Cone : height = {0}".format(height)) # imprime no terminal a altura do cone
-        print("Cone : colors = {0}".format(colors)) # imprime no terminal as cores
-
+        print("Cone não implementado ainda")
+        
     @staticmethod
     def cylinder(radius, height, colors):
-        """Função usada para renderizar Cilindros."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry3D.html#Cylinder
-        # A função cylinder é usada para desenhar cilindros na cena. O cilindro é centrado no
-        # (0, 0, 0) no sistema de coordenadas local. O argumento radius especifica o
-        # raio da base do cilindro e o argumento height especifica a altura do cilindro.
-        # O cilindro é alinhado com o eixo Y local. O cilindro é fechado por padrão em ambas as extremidades.
-        # Para desenha esse cilindro você vai precisar tesselar ele em triângulos, para isso
-        # encontre os vértices e defina os triângulos.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cylinder : radius = {0}".format(radius)) # imprime no terminal o raio do cilindro
-        print("Cylinder : height = {0}".format(height)) # imprime no terminal a altura do cilindro
-        print("Cylinder : colors = {0}".format(colors)) # imprime no terminal as cores
-
+        print("Cylinder não implementado ainda")
+        
     @staticmethod
     def navigationInfo(headlight):
-        """Características físicas do avatar do visualizador e do modelo de visualização."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/navigation.html#NavigationInfo
-        # O campo do headlight especifica se um navegador deve acender um luz direcional que
-        # sempre aponta na direção que o usuário está olhando. Definir este campo como TRUE
-        # faz com que o visualizador forneça sempre uma luz do ponto de vista do usuário.
-        # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
-        # ambientIntensity = 0,0 e direção = (0 0 −1).
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
-
+        print("NavigationInfo não implementado ainda")
+        
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
-        """Luz direcional ou paralela."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/lighting.html#DirectionalLight
-        # Define uma fonte de luz direcional que ilumina ao longo de raios paralelos
-        # em um determinado vetor tridimensional. Possui os campos básicos ambientIntensity,
-        # cor, intensidade. O campo de direção especifica o vetor de direção da iluminação
-        # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
-        # longo de raios paralelos de uma distância infinita.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
-
+        print("DirectionalLight não implementado ainda")
+        
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
-        """Luz pontual."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/lighting.html#PointLight
-        # Fonte de luz pontual em um local 3D no sistema de coordenadas local. Uma fonte
-        # de luz pontual emite luz igualmente em todas as direções; ou seja, é omnidirecional.
-        # Possui os campos básicos ambientIntensity, cor, intensidade. Um nó PointLight ilumina
-        # a geometria em um raio de sua localização. O campo do raio deve ser maior ou igual a
-        # zero. A iluminação do nó PointLight diminui com a distância especificada.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("PointLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("PointLight : color = {0}".format(color)) # imprime no terminal
-        print("PointLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("PointLight : location = {0}".format(location)) # imprime no terminal
-
+        print("PointLight não implementado ainda")
+        
     @staticmethod
     def fog(visibilityRange, color):
-        """Névoa."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/environmentalEffects.html#Fog
-        # O nó Fog fornece uma maneira de simular efeitos atmosféricos combinando objetos
-        # com a cor especificada pelo campo de cores com base nas distâncias dos
-        # vários objetos ao visualizador. A visibilidadeRange especifica a distância no
-        # sistema de coordenadas local na qual os objetos são totalmente obscurecidos
-        # pela névoa. Os objetos localizados fora de visibilityRange do visualizador são
-        # desenhados com uma cor de cor constante. Objetos muito próximos do visualizador
-        # são muito pouco misturados com a cor do nevoeiro.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Fog : color = {0}".format(color)) # imprime no terminal
-        print("Fog : visibilityRange = {0}".format(visibilityRange))
-
+        print("Fog não implementado ainda")
+        
     @staticmethod
     def timeSensor(cycleInterval, loop):
-        """Gera eventos conforme o tempo passa."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/time.html#TimeSensor
-        # Os nós TimeSensor podem ser usados para muitas finalidades, incluindo:
-        # Condução de simulações e animações contínuas; Controlar atividades periódicas;
-        # iniciar eventos de ocorrência única, como um despertador;
-        # Se, no final de um ciclo, o valor do loop for FALSE, a execução é encerrada.
-        # Por outro lado, se o loop for TRUE no final de um ciclo, um nó dependente do
-        # tempo continua a execução no próximo ciclo. O ciclo de um nó TimeSensor dura
-        # cycleInterval segundos. O valor de cycleInterval deve ser maior que zero.
-
-        # Deve retornar a fração de tempo passada em fraction_changed
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
-
-        # Esse método já está implementado para os alunos como exemplo
-        epoch = time.time()  # time in seconds since the epoch as a floating point number.
+        epoch = time.time()
         fraction_changed = (epoch % cycleInterval) / cycleInterval
-
         return fraction_changed
-
+        
     @staticmethod
     def splinePositionInterpolator(set_fraction, key, keyValue, closed):
-        """Interpola não linearmente entre uma lista de vetores 3D."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/interpolators.html#SplinePositionInterpolator
-        # Interpola não linearmente entre uma lista de vetores 3D. O campo keyValue possui
-        # uma lista com os valores a serem interpolados, key possui uma lista respectiva de chaves
-        # dos valores em keyValue, a fração a ser interpolada vem de set_fraction que varia de
-        # zeroa a um. O campo keyValue deve conter exatamente tantos vetores 3D quanto os
-        # quadros-chave no key. O campo closed especifica se o interpolador deve tratar a malha
-        # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
-        # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
-
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("SplinePositionInterpolator : set_fraction = {0}".format(set_fraction))
-        print("SplinePositionInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("SplinePositionInterpolator : keyValue = {0}".format(keyValue))
-        print("SplinePositionInterpolator : closed = {0}".format(closed))
-
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0.0, 0.0, 0.0]
+        print("SplinePositionInterpolator não implementado ainda")
+        return [0.0, 0.0, 0.0]
         
-        return value_changed
-
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
-        """Interpola entre uma lista de valores de rotação especificos."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/interpolators.html#OrientationInterpolator
-        # Interpola rotações são absolutas no espaço do objeto e, portanto, não são cumulativas.
-        # Uma orientação representa a posição final de um objeto após a aplicação de uma rotação.
-        # Um OrientationInterpolator interpola entre duas orientações calculando o caminho mais
-        # curto na esfera unitária entre as duas orientações. A interpolação é linear em
-        # comprimento de arco ao longo deste caminho. Os resultados são indefinidos se as duas
-        # orientações forem diagonalmente opostas. O campo keyValue possui uma lista com os
-        # valores a serem interpolados, key possui uma lista respectiva de chaves
-        # dos valores em keyValue, a fração a ser interpolada vem de set_fraction que varia de
-        # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
-        # quadros-chave no key.
+        print("OrientationInterpolator não implementado ainda")
+        return [0, 0, 1, 0]
+    width = 800
+    height = 600
+    near = 0.01
+    far = 1000
+    
+    # Matrizes para pipeline 3D
+    model_matrix = np.eye(4)
+    view_matrix = np.eye(4)
+    projection_matrix = np.eye(4)
+    transform_stack = []
+    
+    # Dados da câmera
+    camera_position = [0, 0, 0]
+    camera_orientation = [0, 0, 1, 0]
+    camera_fov = math.pi/4
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("OrientationInterpolator : set_fraction = {0}".format(set_fraction))
-        print("OrientationInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("OrientationInterpolator : keyValue = {0}".format(keyValue))
+    @staticmethod
+    def setup(width, height, near=0.01, far=1000):
+        """Definir parâmetros para câmera de razão de aspecto, plano próximo e distante."""
+        GL.width = width
+        GL.height = height
+        GL.near = near
+        GL.far = far
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0, 0, 1, 0]
+    # ---------- Funções de utilidade ----------
+    @staticmethod
+    def _rgb8(c):
+        r, g, b = c if c else (1.0, 1.0, 1.0)
+        if max(r, g, b) <= 1.0:
+            return [int(r*255 + 0.5), int(g*255 + 0.5), int(b*255 + 0.5)]
+        return [int(r), int(g), int(b)]
 
-        return value_changed
+    @staticmethod
+    def _in_bounds(u, v):
+        return 0 <= u < GL.width and 0 <= v < GL.height
 
-    # Para o futuro (Não para versão atual do projeto.)
-    def vertex_shader(self, shader):
-        """Para no futuro implementar um vertex shader."""
+    @staticmethod
+    def _put(u, v, col):
+        if GL._in_bounds(u, v):
+            gpu.GPU.draw_pixel([u, v], gpu.GPU.RGB8, col)
 
-    def fragment_shader(self, shader):
-        """Para no futuro implementar um fragment shader."""
+    @staticmethod
+    def _edge(ax, ay, bx, by, px, py):
+        return (px-ax)*(by-ay) - (py-ay)*(bx-ax)
+
+    @staticmethod
+    def _create_rotation_matrix(axis, angle):
+        """Cria matriz de rotação usando fórmula de Rodrigues."""
+        if np.linalg.norm(axis) == 0:
+            return np.eye(4)
+            
+        axis = np.array(axis) / np.linalg.norm(axis)
+        c = np.cos(angle)
+        s = np.sin(angle)
+        
+        R = np.eye(4)
+        R[:3,:3] = np.array([
+            [c + axis[0]**2*(1-c), axis[0]*axis[1]*(1-c) - axis[2]*s, axis[0]*axis[2]*(1-c) + axis[1]*s],
+            [axis[1]*axis[0]*(1-c) + axis[2]*s, c + axis[1]**2*(1-c), axis[1]*axis[2]*(1-c) - axis[0]*s],
+            [axis[2]*axis[0]*(1-c) - axis[1]*s, axis[2]*axis[1]*(1-c) + axis[0]*s, c + axis[2]**2*(1-c)]
+        ])
+        return R
+
+    @staticmethod
+    def _create_perspective_matrix(fov, aspect, near, far):
+        """Cria matriz de projeção perspectiva."""
+        f = 1.0 / np.tan(fov / 2.0)
+        P = np.zeros((4, 4))
+        P[0,0] = f / aspect
+        P[1,1] = f
+        P[2,2] = (far + near) / (near - far)
+        P[2,3] = (2 * far * near) / (near - far)
+        P[3,2] = -1
+        return P
+
+    @staticmethod
+    def _create_view_matrix(position, orientation):
+        """Cria matriz de visualização da câmera."""
+        # Posição da câmera
+        eye = np.array(position)
+        
+        # Vetor de direção baseado na orientação
+        axis = np.array(orientation[:3])
+        angle = orientation[3]
+        
+        # Direção inicial (olhando para -Z)
+        forward = np.array([0, 0, -1])
+        up = np.array([0, 1, 0])
+        
+        # Aplica rotação da câmera
+        if np.linalg.norm(axis) > 0:
+            R = GL._create_rotation_matrix(axis, angle)
+            forward = (R[:3,:3] @ forward)
+            up = (R[:3,:3] @ up)
+        
+        # Calcula vetores da câmera
+        target = eye + forward
+        
+        # Constrói matriz de visualização (lookAt)
+        f = (target - eye) / np.linalg.norm(target - eye)
+        s = np.cross(f, up) / np.linalg.norm(np.cross(f, up))
+        u = np.cross(s, f)
+        
+        view = np.eye(4)
+        view[:3,0] = s
+        view[:3,1] = u
+        view[:3,2] = -f
+        view[0,3] = -np.dot(s, eye)
+        view[1,3] = -np.dot(u, eye)
+        view[2,3] = np.dot(f, eye)
+        
+        return view
+
+    @staticmethod
+    def _project_vertex(vertex):
+        """Aplica pipeline completo de transformação 3D."""
+        # Aplica transformações do modelo
+        v_world = GL.model_matrix @ vertex
+        
+        # Aplica transformação da câmera
+        v_view = GL.view_matrix @ v_world
+        
+        # Aplica projeção perspectiva
+        v_clip = GL.projection_matrix @ v_view
+        
+        # Divisão perspectiva
+        if v_clip[3] != 0:
+            v_ndc = v_clip / v_clip[3]
+        else:
+            v_ndc = v_clip
+        
+        # Transformação para coordenadas de tela
+        x_screen = (v_ndc[0] + 1) * GL.width / 2
+        y_screen = (1 - v_ndc[1]) * GL.height / 2
+        
+        return x_screen, y_screen, v_ndc[2]
+
+    @staticmethod
+    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color):
+        """Rasteriza um triângulo com test de profundidade simples."""
+        # Converte para inteiros
+        x0, y0 = int(round(x0)), int(round(y0))
+        x1, y1 = int(round(x1)), int(round(y1))
+        x2, y2 = int(round(x2)), int(round(y2))
+        
+        # Bounding box
+        minx = max(min(x0, x1, x2), 0)
+        maxx = min(max(x0, x1, x2), GL.width-1)
+        miny = max(min(y0, y1, y2), 0)
+        maxy = min(max(y0, y1, y2), GL.height-1)
+        
+        # Área do triângulo
+        area = GL._edge(x0, y0, x1, y1, x2, y2)
+        if area == 0:
+            return
+        
+        # Rasterização
+        for y in range(miny, maxy+1):
+            for x in range(minx, maxx+1):
+                w0 = GL._edge(x1, y1, x2, y2, x, y)
+                w1 = GL._edge(x2, y2, x0, y0, x, y)
+                w2 = GL._edge(x0, y0, x1, y1, x, y)
+                
+                # Teste de dentro do triângulo
+                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, color)
+
+    # ---------- Implementações principais ----------
+    
+    @staticmethod
+    def triangleSet(point, colors):
+        """Função usada para renderizar TriangleSet 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Processa triângulos (cada 9 valores = 3 vértices de 3 coordenadas)
+        for t in range(0, len(point), 9):
+            # Vértices do triângulo
+            v0 = np.array([point[t], point[t+1], point[t+2], 1.0])
+            v1 = np.array([point[t+3], point[t+4], point[t+5], 1.0])
+            v2 = np.array([point[t+6], point[t+7], point[t+8], 1.0])
+            
+            # Projeta vértices
+            x0, y0, z0 = GL._project_vertex(v0)
+            x1, y1, z1 = GL._project_vertex(v1)
+            x2, y2, z2 = GL._project_vertex(v2)
+            
+            # Verifica se está dentro do volume de visualização
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+
+    @staticmethod
+    def viewpoint(position, orientation, fieldOfView):
+        """Função usada para configurar o viewpoint (câmera)."""
+        GL.camera_position = position
+        GL.camera_orientation = orientation
+        GL.camera_fov = fieldOfView
+        
+        # Atualiza matriz de visualização
+        GL.view_matrix = GL._create_view_matrix(position, orientation)
+        
+        # Atualiza matriz de projeção
+        aspect = GL.width / GL.height
+        GL.projection_matrix = GL._create_perspective_matrix(fieldOfView, aspect, GL.near, GL.far)
+
+    @staticmethod
+    def transform_in(translation, scale, rotation):
+        """Função usada para aplicar transformações hierárquicas."""
+        # Salva estado atual na pilha
+        GL.transform_stack.append(GL.model_matrix.copy())
+        
+        # Cria matrizes de transformação
+        T = np.eye(4)  # Translação
+        R = np.eye(4)  # Rotação
+        S = np.eye(4)  # Escala
+        
+        # Matriz de escala
+        if scale:
+            S[0,0] = scale[0]
+            S[1,1] = scale[1]
+            S[2,2] = scale[2]
+        
+        # Matriz de rotação
+        if rotation and len(rotation) == 4:
+            axis = rotation[:3]
+            angle = rotation[3]
+            R = GL._create_rotation_matrix(axis, angle)
+        
+        # Matriz de translação
+        if translation:
+            T[0,3] = translation[0]
+            T[1,3] = translation[1]
+            T[2,3] = translation[2]
+        
+        # Combina transformações: T * R * S (ordem importante!)
+        transform = T @ R @ S
+        GL.model_matrix = GL.model_matrix @ transform
+
+    @staticmethod
+    def transform_out():
+        """Função usada para sair de uma transformação hierárquica."""
+        # Restaura estado anterior da pilha
+        if GL.transform_stack:
+            GL.model_matrix = GL.transform_stack.pop()
+        else:
+            GL.model_matrix = np.eye(4)
+
+    # ---------- Implementações 2D existentes ----------
+    
+    @staticmethod
+    def polypoint2D(point, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        for i in range(0, len(point), 2):
+            u = int(round(point[i]))
+            v = int(round(point[i+1]))
+            GL._put(u, v, col)
+
+    @staticmethod
+    def polyline2D(lineSegments, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        if len(lineSegments) < 4:
+            return
+        for i in range(0, len(lineSegments)-2, 2):
+            x0, y0 = lineSegments[i], lineSegments[i+1]
+            x1, y1 = lineSegments[i+2], lineSegments[i+3]
+            GL._bresenham(x0, y0, x1, y1, col)
+
+    @staticmethod
+    def _bresenham(x0, y0, x1, y1, col):
+        x0, y0 = int(round(x0)), int(round(y0))
+        x1, y1 = int(round(x1)), int(round(y1))
+        dx, dy = abs(x1-x0), abs(y1-y0)
+        sx, sy = (1, -1)[x0 > x1], (1, -1)[y0 > y1]
+        err = dx - dy
+        while True:
+            GL._put(x0, y0, col)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2*err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+    @staticmethod
+    def circle2D(radius, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        cx, cy = 0.0, 0.0
+        step = 1
+        x_prev = cx + radius * math.sin(math.radians(0))
+        y_prev = cy + radius * math.cos(math.radians(0))
+        for deg in range(step, 360+step, step):
+            x = cx + radius * math.sin(math.radians(deg))
+            y = cy + radius * math.cos(math.radians(deg))
+            GL._bresenham(x_prev, y_prev, x, y, col)
+            x_prev, y_prev = x, y
+
+    @staticmethod
+    def triangleSet2D(vertices, colors):
+        col = GL._rgb8(colors.get("emissiveColor"))
+        for t in range(0, len(vertices), 6):
+            x0, y0 = vertices[t], vertices[t+1]
+            x1, y1 = vertices[t+2], vertices[t+3]
+            x2, y2 = vertices[t+4], vertices[t+5]
+
+            X0, Y0 = int(round(x0)), int(round(y0))
+            X1, Y1 = int(round(x1)), int(round(y1))
+            X2, Y2 = int(round(x2)), int(round(y2))
+
+            minx = max(min(X0, X1, X2), 0)
+            maxx = min(max(X0, X1, X2), GL.width-1)
+            miny = max(min(Y0, Y1, Y2), 0)
+            maxy = min(max(Y0, Y1, Y2), GL.height-1)
+
+            area = GL._edge(X0, Y0, X1, Y1, X2, Y2)
+            if area == 0:
+                continue
+
+            for y in range(miny, maxy+1):
+                for x in range(minx, maxx+1):
+                    w0 = GL._edge(X1, Y1, X2, Y2, x, y)
+                    w1 = GL._edge(X2, Y2, X0, Y0, x, y)
+                    w2 = GL._edge(X0, Y0, X1, Y1, x, y)
+                    if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
+
+    # ---------- Funções não implementadas (stubs) ----------
+    
+    @staticmethod
+    def triangleStripSet(point, stripCount, colors):
+        print("TriangleStripSet não implementado ainda")
+        
+    @staticmethod
+    def indexedTriangleStripSet(point, index, colors):
+        print("IndexedTriangleStripSet não implementado ainda")
+        
+    @staticmethod
+    def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
+                       texCoord, texCoordIndex, colors, current_texture):
+        print("IndexedFaceSet não implementado ainda")
+        
+    @staticmethod
+    def box(size, colors):
+        print("Box não implementado ainda")
+        
+    @staticmethod
+    def sphere(radius, colors):
+        print("Sphere não implementado ainda")
+        
+    @staticmethod
+    def cone(bottomRadius, height, colors):
+        print("Cone não implementado ainda")
+        
+    @staticmethod
+    def cylinder(radius, height, colors):
+        print("Cylinder não implementado ainda")
+        
+    @staticmethod
+    def navigationInfo(headlight):
+        print("NavigationInfo não implementado ainda")
+        
+    @staticmethod
+    def directionalLight(ambientIntensity, color, intensity, direction):
+        print("DirectionalLight não implementado ainda")
+        
+    @staticmethod
+    def pointLight(ambientIntensity, color, intensity, location):
+        print("PointLight não implementado ainda")
+        
+    @staticmethod
+    def fog(visibilityRange, color):
+        print("Fog não implementado ainda")
+        
+    @staticmethod
+    def timeSensor(cycleInterval, loop):
+        epoch = time.time()
+        fraction_changed = (epoch % cycleInterval) / cycleInterval
+        return fraction_changed
+        
+    @staticmethod
+    def splinePositionInterpolator(set_fraction, key, keyValue, closed):
+        print("SplinePositionInterpolator não implementado ainda")
+        return [0.0, 0.0, 0.0]
+        
+    @staticmethod
+    def orientationInterpolator(set_fraction, key, keyValue):
+        print("OrientationInterpolator não implementado ainda")
+        return [0, 0, 1, 0]
