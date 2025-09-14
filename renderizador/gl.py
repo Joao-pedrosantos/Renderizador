@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: UTF-8 -*-
-
-# pylint: disable=invalid-name
-
 """
 Biblioteca Gráfica / Graphics Library.
 
@@ -231,6 +226,134 @@ class GL:
                 GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
 
     @staticmethod
+    def triangleStripSet(point, stripCount, colors):
+        """Função usada para renderizar TriangleStripSet 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        point_idx = 0
+        
+        # Processa cada strip
+        for strip_size in stripCount:
+            if strip_size < 3:  # Precisa de pelo menos 3 pontos para formar triângulos
+                point_idx += strip_size * 3  # Pula os pontos desta strip
+                continue
+                
+            # Coleta os vértices desta strip
+            strip_vertices = []
+            for i in range(strip_size):
+                v = np.array([
+                    point[point_idx + i*3],
+                    point[point_idx + i*3 + 1], 
+                    point[point_idx + i*3 + 2],
+                    1.0
+                ])
+                strip_vertices.append(v)
+            
+            # Gera triângulos a partir da strip
+            # Para cada trio consecutivo de vértices, forma um triângulo
+            for i in range(strip_size - 2):
+                if i % 2 == 0:  # Triângulo com orientação normal
+                    v0, v1, v2 = strip_vertices[i], strip_vertices[i+1], strip_vertices[i+2]
+                else:  # Triângulo com orientação invertida para manter consistência
+                    v0, v1, v2 = strip_vertices[i+1], strip_vertices[i], strip_vertices[i+2]
+                
+                # Projeta vértices
+                x0, y0, z0 = GL._project_vertex(v0)
+                x1, y1, z1 = GL._project_vertex(v1)
+                x2, y2, z2 = GL._project_vertex(v2)
+                
+                # Verifica se está dentro do volume de visualização
+                if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                    0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                    0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                    GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            
+            point_idx += strip_size * 3  # Move para próxima strip
+
+    @staticmethod
+    def indexedTriangleStripSet(point, index, colors):
+        """Função usada para renderizar IndexedTriangleStripSet 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Converte pontos em array de vértices
+        vertices = []
+        for i in range(0, len(point), 3):
+            v = np.array([point[i], point[i+1], point[i+2], 1.0])
+            vertices.append(v)
+        
+        # Processa índices para formar strips
+        current_strip = []
+        
+        for idx in index:
+            if idx == -1:  # Fim de uma strip
+                if len(current_strip) >= 3:
+                    # Processa a strip atual
+                    for i in range(len(current_strip) - 2):
+                        if i % 2 == 0:  # Triângulo com orientação normal
+                            i0, i1, i2 = current_strip[i], current_strip[i+1], current_strip[i+2]
+                        else:  # Triângulo com orientação invertida
+                            i0, i1, i2 = current_strip[i+1], current_strip[i], current_strip[i+2]
+                        
+                        v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
+                        
+                        # Projeta vértices
+                        x0, y0, z0 = GL._project_vertex(v0)
+                        x1, y1, z1 = GL._project_vertex(v1)
+                        x2, y2, z2 = GL._project_vertex(v2)
+                        
+                        # Verifica se está dentro do volume de visualização
+                        if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                            0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                            0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                
+                current_strip = []  # Reinicia para próxima strip
+            else:
+                current_strip.append(idx)
+
+    @staticmethod
+    def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
+                       texCoord, texCoordIndex, colors, current_texture):
+        """Função usada para renderizar IndexedFaceSet 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Converte coordenadas em array de vértices
+        vertices = []
+        for i in range(0, len(coord), 3):
+            v = np.array([coord[i], coord[i+1], coord[i+2], 1.0])
+            vertices.append(v)
+        
+        # Processa índices para formar faces
+        current_face = []
+        
+        for idx in coordIndex:
+            if idx == -1:  # Fim de uma face
+                if len(current_face) >= 3:
+                    # Triangula a face usando fan triangulation
+                    # Conecta o primeiro vértice com todos os pares consecutivos
+                    for i in range(1, len(current_face) - 1):
+                        i0 = current_face[0]      # Vértice central
+                        i1 = current_face[i]      # Vértice atual
+                        i2 = current_face[i + 1]  # Próximo vértice
+                        
+                        v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
+                        
+                        # Projeta vértices
+                        x0, y0, z0 = GL._project_vertex(v0)
+                        x1, y1, z1 = GL._project_vertex(v1)
+                        x2, y2, z2 = GL._project_vertex(v2)
+                        
+                        # Verifica se está dentro do volume de visualização
+                        if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                            0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                            0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                
+                current_face = []  # Reinicia para próxima face
+            else:
+                current_face.append(idx)
+
+    @staticmethod
     def viewpoint(position, orientation, fieldOfView):
         """Função usada para configurar o viewpoint (câmera)."""
         # print(f"DEBUG Viewpoint: position={position}, orientation={orientation}, fov={fieldOfView}")
@@ -290,6 +413,222 @@ class GL:
             GL.model_matrix = GL.transform_stack.pop()
         else:
             GL.model_matrix = np.eye(4)
+
+    @staticmethod
+    def box(size, colors):
+        """Função usada para renderizar Box 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Dimensões da caixa
+        sx, sy, sz = size[0]/2, size[1]/2, size[2]/2
+        
+        # Vértices da caixa
+        vertices = [
+            np.array([-sx, -sy, -sz, 1.0]),  # 0
+            np.array([ sx, -sy, -sz, 1.0]),  # 1
+            np.array([ sx,  sy, -sz, 1.0]),  # 2
+            np.array([-sx,  sy, -sz, 1.0]),  # 3
+            np.array([-sx, -sy,  sz, 1.0]),  # 4
+            np.array([ sx, -sy,  sz, 1.0]),  # 5
+            np.array([ sx,  sy,  sz, 1.0]),  # 6
+            np.array([-sx,  sy,  sz, 1.0]),  # 7
+        ]
+        
+        # Faces da caixa (triângulos)
+        faces = [
+            # Face frontal
+            [0, 1, 2], [0, 2, 3],
+            # Face traseira
+            [5, 4, 7], [5, 7, 6],
+            # Face esquerda
+            [4, 0, 3], [4, 3, 7],
+            # Face direita
+            [1, 5, 6], [1, 6, 2],
+            # Face inferior
+            [4, 5, 1], [4, 1, 0],
+            # Face superior
+            [3, 2, 6], [3, 6, 7],
+        ]
+        
+        # Renderiza cada face
+        for face in faces:
+            v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+            
+            # Projeta vértices
+            x0, y0, z0 = GL._project_vertex(v0)
+            x1, y1, z1 = GL._project_vertex(v1)
+            x2, y2, z2 = GL._project_vertex(v2)
+            
+            # Verifica se está dentro do volume de visualização
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+
+    @staticmethod
+    def sphere(radius, colors):
+        """Função usada para renderizar Sphere 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        # Parâmetros da esfera
+        slices = 16  # Divisões longitudinais
+        stacks = 16  # Divisões latitudinais
+        
+        # Gera vértices da esfera
+        vertices = []
+        for i in range(stacks + 1):
+            phi = np.pi * i / stacks  # Ângulo latitudinal
+            for j in range(slices + 1):
+                theta = 2 * np.pi * j / slices  # Ângulo longitudinal
+                
+                x = radius * np.sin(phi) * np.cos(theta)
+                y = radius * np.cos(phi)
+                z = radius * np.sin(phi) * np.sin(theta)
+                
+                vertices.append(np.array([x, y, z, 1.0]))
+        
+        # Gera faces (triângulos)
+        for i in range(stacks):
+            for j in range(slices):
+                # Índices dos vértices
+                v0 = i * (slices + 1) + j
+                v1 = v0 + 1
+                v2 = (i + 1) * (slices + 1) + j
+                v3 = v2 + 1
+                
+                # Primeiro triângulo
+                if i > 0:  # Evita triângulos degenerados no polo
+                    x0, y0, z0 = GL._project_vertex(vertices[v0])
+                    x1, y1, z1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2 = GL._project_vertex(vertices[v2])
+                    
+                    if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                        0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                        0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                        GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                
+                # Segundo triângulo
+                if i < stacks - 1:  # Evita triângulos degenerados no polo
+                    x1, y1, z1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2 = GL._project_vertex(vertices[v2])
+                    x3, y3, z3 = GL._project_vertex(vertices[v3])
+                    
+                    if (0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                        0 <= x2 < GL.width and 0 <= y2 < GL.height and
+                        0 <= x3 < GL.width and 0 <= y3 < GL.height):
+                        GL._rasterize_triangle(x1, y1, z1, x3, y3, z3, x2, y2, z2, col)
+
+    @staticmethod
+    def cone(bottomRadius, height, colors):
+        """Função usada para renderizar Cone 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        sides = 16  # Número de lados do cone
+        
+        # Vértice do topo
+        top = np.array([0, height/2, 0, 1.0])
+        
+        # Vértices da base
+        base_vertices = []
+        center = np.array([0, -height/2, 0, 1.0])
+        
+        for i in range(sides):
+            angle = 2 * np.pi * i / sides
+            x = bottomRadius * np.cos(angle)
+            z = bottomRadius * np.sin(angle)
+            y = -height/2
+            base_vertices.append(np.array([x, y, z, 1.0]))
+        
+        # Faces laterais
+        for i in range(sides):
+            next_i = (i + 1) % sides
+            
+            x0, y0, z0 = GL._project_vertex(top)
+            x1, y1, z1 = GL._project_vertex(base_vertices[i])
+            x2, y2, z2 = GL._project_vertex(base_vertices[next_i])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+        
+        # Base do cone
+        for i in range(1, sides - 1):
+            x0, y0, z0 = GL._project_vertex(center)
+            x1, y1, z1 = GL._project_vertex(base_vertices[0])
+            x2, y2, z2 = GL._project_vertex(base_vertices[i])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+
+    @staticmethod
+    def cylinder(radius, height, colors):
+        """Função usada para renderizar Cylinder 3D."""
+        col = GL._rgb8(colors.get("emissiveColor"))
+        
+        sides = 16  # Número de lados do cilindro
+        
+        # Vértices do topo e base
+        top_vertices = []
+        bottom_vertices = []
+        top_center = np.array([0, height/2, 0, 1.0])
+        bottom_center = np.array([0, -height/2, 0, 1.0])
+        
+        for i in range(sides):
+            angle = 2 * np.pi * i / sides
+            x = radius * np.cos(angle)
+            z = radius * np.sin(angle)
+            
+            top_vertices.append(np.array([x, height/2, z, 1.0]))
+            bottom_vertices.append(np.array([x, -height/2, z, 1.0]))
+        
+        # Faces laterais
+        for i in range(sides):
+            next_i = (i + 1) % sides
+            
+            # Primeiro triângulo da face lateral
+            x0, y0, z0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1 = GL._project_vertex(top_vertices[i])
+            x2, y2, z2 = GL._project_vertex(top_vertices[next_i])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            
+            # Segundo triângulo da face lateral
+            x0, y0, z0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1 = GL._project_vertex(top_vertices[next_i])
+            x2, y2, z2 = GL._project_vertex(bottom_vertices[next_i])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+        
+        # Tampa superior
+        for i in range(1, sides - 1):
+            x0, y0, z0 = GL._project_vertex(top_center)
+            x1, y1, z1 = GL._project_vertex(top_vertices[0])
+            x2, y2, z2 = GL._project_vertex(top_vertices[i + 1])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+        
+        # Tampa inferior
+        for i in range(1, sides - 1):
+            x0, y0, z0 = GL._project_vertex(bottom_center)
+            x1, y1, z1 = GL._project_vertex(bottom_vertices[0])
+            x2, y2, z2 = GL._project_vertex(bottom_vertices[i])
+            
+            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
+                0 <= x1 < GL.width and 0 <= y1 < GL.height and
+                0 <= x2 < GL.width and 0 <= y2 < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
 
     # ---------- Implementações 2D existentes ----------
     
@@ -372,36 +711,7 @@ class GL:
                     if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
                         gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
 
-    # ---------- Funções não implementadas (stubs) ----------
-    
-    @staticmethod
-    def triangleStripSet(point, stripCount, colors):
-        print("TriangleStripSet não implementado ainda")
-        
-    @staticmethod
-    def indexedTriangleStripSet(point, index, colors):
-        print("IndexedTriangleStripSet não implementado ainda")
-        
-    @staticmethod
-    def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
-                       texCoord, texCoordIndex, colors, current_texture):
-        print("IndexedFaceSet não implementado ainda")
-        
-    @staticmethod
-    def box(size, colors):
-        print("Box não implementado ainda")
-        
-    @staticmethod
-    def sphere(radius, colors):
-        print("Sphere não implementado ainda")
-        
-    @staticmethod
-    def cone(bottomRadius, height, colors):
-        print("Cone não implementado ainda")
-        
-    @staticmethod
-    def cylinder(radius, height, colors):
-        print("Cylinder não implementado ainda")
+    # ---------- Funções não implementadas ou auxiliares ----------
         
     @staticmethod
     def navigationInfo(headlight):
