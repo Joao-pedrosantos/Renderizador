@@ -1,5 +1,5 @@
 """
-Biblioteca Gráfica / Graphics Library.
+Biblioteca Gráfica / Graphics Library - Correções para Iluminação.
 
 Desenvolvido por: João Pedro Rodrigues dos Santos
 Disciplina: Computação Gráfica
@@ -31,6 +31,10 @@ class GL:
     camera_fov = math.pi/4
     useLighting = False
 
+    # Luzes
+    lights = []
+    ambient_global = [0.1, 0.1, 0.1]  # intensidade ambiente padrão
+
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
         """Definir parâmetros para câmera de razão de aspecto, plano próximo e distante."""
@@ -39,6 +43,7 @@ class GL:
         GL.near = near
         GL.far = far
         GL.useLighting = False
+        GL.lights = []  # Reset lights
 
     # ---------- Funções de utilidade ----------
     @staticmethod
@@ -47,6 +52,18 @@ class GL:
         if max(r, g, b) <= 1.0:
             return [int(r*255 + 0.5), int(g*255 + 0.5), int(b*255 + 0.5)]
         return [int(r), int(g), int(b)]
+
+    @staticmethod
+    def _get_base_color(colors):
+        """Retorna a cor base do material (prioriza diffuseColor)."""
+        if colors is None:
+            return [255, 255, 255]
+        if "diffuseColor" in colors:
+            return GL._rgb8(colors["diffuseColor"])
+        if "emissiveColor" in colors:
+            return GL._rgb8(colors["emissiveColor"])
+        return [255, 255, 255]
+
 
     @staticmethod
     def _in_bounds(u, v):
@@ -237,13 +254,73 @@ class GL:
         x_screen = (v_ndc[0] + 1) * GL.width / 2
         y_screen = (1 - v_ndc[1]) * GL.height / 2
         
-        return x_screen, y_screen, v_ndc[2], w_clip
+        return x_screen, y_screen, v_ndc[2], w_clip, v_world[:3]  # Adiciona posição no mundo
+
+    @staticmethod
+    def _calculate_lighting(world_pos, normal, material_colors):
+        """Calcula iluminação usando modelo de Phong (diffuse, specular, ambient)."""
+        if not GL.useLighting or not GL.lights:
+            return [1.0, 1.0, 1.0]
+
+        # Material
+        diffuse_color = np.array(material_colors.get("diffuseColor", [0.8, 0.8, 0.8]))
+        specular_color = np.array(material_colors.get("specularColor", [0.0, 0.0, 0.0]))
+        shininess = material_colors.get("shininess", 0.2)  # normalizado
+        ambient_intensity = material_colors.get("ambientIntensity", 0.2)
+
+        # Normal
+        if np.linalg.norm(normal) > 0:
+            normal = normal / np.linalg.norm(normal)
+        else:
+            normal = np.array([0, 0, 1])
+
+        # Direção para câmera
+        camera_pos = np.array(GL.camera_position)
+        view_dir = camera_pos - world_pos
+        if np.linalg.norm(view_dir) > 0:
+            view_dir = view_dir / np.linalg.norm(view_dir)
+
+        final_color = np.zeros(3)
+
+        # Luz ambiente global
+        ambient = ambient_intensity * np.array(GL.ambient_global) * diffuse_color
+        final_color += ambient
+
+        # Luzes
+        for light in GL.lights:
+            light_color = np.array(light["color"])
+            
+            if light["type"] == "directional":
+                light_dir = -np.array(light["direction"])
+                light_dir /= np.linalg.norm(light_dir)
+
+                # Difusa
+                diff_factor = max(0.0, np.dot(normal, light_dir))
+                diffuse = diff_factor * light["intensity"] * light_color * diffuse_color
+
+                # Especular (Blinn-Phong)
+                specular = np.zeros(3)
+                if shininess > 0 and diff_factor > 0:
+                    half_dir = (light_dir + view_dir)
+                    if np.linalg.norm(half_dir) > 0:
+                        half_dir /= np.linalg.norm(half_dir)
+                        spec_factor = pow(max(0.0, np.dot(normal, half_dir)), shininess * 128)
+                        specular = spec_factor * light["intensity"] * light_color * specular_color
+
+                # Ambiente da luz
+                light_ambient = light["ambientIntensity"] * light_color * diffuse_color
+
+                final_color += light_ambient + diffuse + specular
+
+        return np.clip(final_color, 0.0, 1.0).tolist()
+
 
     @staticmethod
     def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2,
-                            color, colors=None, w0_3d=None, w1_3d=None, w2_3d=None,
-                            transparency=1.0, texture=None, texcoords=None):
-        """Rasteriza um triângulo com teste de profundidade, interpolação de cores, transparência e textura."""
+                            color, vertex_colors=None, w0_3d=None, w1_3d=None, w2_3d=None,
+                            transparency=1.0, texture=None, texcoords=None,
+                            world_pos0=None, world_pos1=None, world_pos2=None, material_colors=None):
+        """Rasteriza um triângulo com teste de profundidade, interpolação de cores, transparência, textura e iluminação."""
         # Converte para inteiros
         x0, y0 = int(round(x0)), int(round(y0))
         x1, y1 = int(round(x1)), int(round(y1))
@@ -260,6 +337,15 @@ class GL:
         if area <= 0:
             return
         
+        # Calcula normal do triângulo se temos posições do mundo
+        triangle_normal = np.array([0, 0, 1])  # Normal padrão
+        if world_pos0 is not None and world_pos1 is not None and world_pos2 is not None:
+            v1 = world_pos1 - world_pos0
+            v2 = world_pos2 - world_pos0
+            triangle_normal = np.cross(v1, v2)
+            if np.linalg.norm(triangle_normal) > 0:
+                triangle_normal = triangle_normal / np.linalg.norm(triangle_normal)
+        
         inv_area = 1.0 / area
         for y in range(miny, maxy+1):
             for x in range(minx, maxx+1):
@@ -268,7 +354,7 @@ class GL:
                 w2 = GL._edge(x0, y0, x1, y1, x, y)
 
                 inside = ((w0 >= 0 and w1 >= 0 and w2 >= 0) or
-                        (w0 <= 0 and w1 <= 0 and w2 <= 0))
+                          (w0 <= 0 and w1 <= 0 and w2 <= 0))
                 if not inside:
                     continue
 
@@ -296,16 +382,29 @@ class GL:
                     final_color = color if color else [255, 255, 255]
 
                     # Interpola cores se fornecidas
-                    if colors and w0_3d and w1_3d and w2_3d:
+                    if vertex_colors and w0_3d and w1_3d and w2_3d:
                         alpha_c = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
                         beta_c  = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
                         gamma_c = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                        r = int(alpha_c*colors[0][0] + beta_c*colors[1][0] + gamma_c*colors[2][0])
-                        g = int(alpha_c*colors[0][1] + beta_c*colors[1][1] + gamma_c*colors[2][1])
-                        b = int(alpha_c*colors[0][2] + beta_c*colors[1][2] + gamma_c*colors[2][2])
+                        r = int(alpha_c*vertex_colors[0][0] + beta_c*vertex_colors[1][0] + gamma_c*vertex_colors[2][0])
+                        g = int(alpha_c*vertex_colors[0][1] + beta_c*vertex_colors[1][1] + gamma_c*vertex_colors[2][1])
+                        b = int(alpha_c*vertex_colors[0][2] + beta_c*vertex_colors[1][2] + gamma_c*vertex_colors[2][2])
                         final_color = [max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b))]
 
-                    # Aplica textura (fora do if de cores!)
+                    # --- Iluminação (Phong) ---
+                    if GL.useLighting and material_colors and world_pos0 is not None:
+                        # Interpola posição no mundo
+                        world_pos = alpha * world_pos0 + beta * world_pos1 + gamma * world_pos2
+                        
+                        # Calcula iluminação
+                        lit_color = GL._calculate_lighting(world_pos, triangle_normal, material_colors)
+                        
+                        # Aplica cor base
+                        base_color = np.array(final_color) / 255.0
+                        final_color = (np.array(lit_color) * base_color * 255).astype(int)
+                        final_color = [max(0, min(255, c)) for c in final_color]
+
+                    # Aplica textura (se houver)
                     if texture is not None and texcoords is not None:
                         if w0_3d and w1_3d and w2_3d:
                             alpha_t = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
@@ -318,17 +417,8 @@ class GL:
                         v = alpha_t*texcoords[0][1] + beta_t*texcoords[1][1] + gamma_t*texcoords[2][1]
                         tex_color = GL._sample_texture(texture, u, v)
 
-                        if tex_color:
-                            if GL.useLighting:
-                                # textura modula cor base
-                                final_color = [
-                                    int((final_color[0]/255.0)*tex_color[0]),
-                                    int((final_color[1]/255.0)*tex_color[1]),
-                                    int((final_color[2]/255.0)*tex_color[2])
-                                ]
-                            else:
-                                # só textura
-                                final_color = tex_color
+                        if tex_color is not None:
+                            final_color = tex_color
 
                     # Transparência (alpha blending simples)
                     if transparency < 1.0:
@@ -344,13 +434,11 @@ class GL:
                     gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, final_color)
 
 
-
-    # ---------- Implementações principais ----------
-    
     @staticmethod
     def triangleSet(point, colors):
         """Função usada para renderizar TriangleSet 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         # Obtém transparência
         transparency = colors.get("transparency", 0.0)
@@ -364,19 +452,75 @@ class GL:
             v2 = np.array([point[t+6], point[t+7], point[t+8], 1.0])
             
             # Projeta vértices
-            x0, y0, z0, w0 = GL._project_vertex(v0)
-            x1, y1, z1, w1 = GL._project_vertex(v1)
-            x2, y2, z2, w2 = GL._project_vertex(v2)
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(v0)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(v1)
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(v2)
             
-            # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+            # Verifica se pelo menos uma parte do triângulo está visível
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2, alpha)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, alpha, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
 
+    @staticmethod
+    def directionalLight(ambientIntensity, color, intensity, direction):
+        """Define uma luz direcional."""
+        print(f"DEBUG: Adicionando luz direcional - intensidade: {intensity}, cor: {color}, direção: {direction}")
+        GL.useLighting = True
+        light = {
+            "type": "directional",
+            "ambientIntensity": ambientIntensity,
+            "color": color,
+            "intensity": intensity,
+            "direction": np.array(direction) / np.linalg.norm(direction) if np.linalg.norm(direction) > 0 else np.array([0, 0, -1])
+        }
+        GL.lights.append(light)
+        print(f"DEBUG: Total de luzes: {len(GL.lights)}, iluminação ativa: {GL.useLighting}")
+
+    @staticmethod
+    def navigationInfo(headlight):
+        """Define configurações de navegação."""
+        print(f"DEBUG: NavigationInfo - headlight: {headlight}")
+        if headlight:
+            # Adiciona uma luz direcional padrão na direção da câmera
+            GL.directionalLight(0.2, [1, 1, 1], 1.0, [0, 0, -1])
+        return 0
+
+    @staticmethod
+    def timeSensor(cycleInterval, loop):
+        """Sensor de tempo para animações."""
+        epoch = time.time()
+        fraction_changed = (epoch % cycleInterval) / cycleInterval
+        return fraction_changed  # precisa retornar para usar no value_changed
+
+        
+    @staticmethod
+    def splinePositionInterpolator(set_fraction, key, keyValue, closed):
+        """Interpolador de posição (linear simplificado)."""
+        if not key or not keyValue:
+            return [0.0, 0.0, 0.0]
+
+        fraction = max(0.0, min(1.0, set_fraction))
+        for i in range(len(key) - 1):
+            if fraction <= key[i + 1]:
+                t = (fraction - key[i]) / (key[i + 1] - key[i])
+                idx0, idx1 = i * 3, (i + 1) * 3
+                x = keyValue[idx0] + t * (keyValue[idx1] - keyValue[idx0])
+                y = keyValue[idx0 + 1] + t * (keyValue[idx1 + 1] - keyValue[idx0 + 1])
+                z = keyValue[idx0 + 2] + t * (keyValue[idx1 + 2] - keyValue[idx0 + 2])
+                return [x, y, z]
+
+        last_idx = (len(key) - 1) * 3
+        return [keyValue[last_idx], keyValue[last_idx + 1], keyValue[last_idx + 2]]
+
+
+    # ---------- Implementações das outras funções ----------
+    
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
         """Função usada para renderizar TriangleStripSet 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
         
         point_idx = 0
         
@@ -398,7 +542,6 @@ class GL:
                 strip_vertices.append(v)
             
             # Gera triângulos a partir da strip
-            # Para cada trio consecutivo de vértices, forma um triângulo
             for i in range(strip_size - 2):
                 if i % 2 == 0:  # Triângulo com orientação normal
                     v0, v1, v2 = strip_vertices[i], strip_vertices[i+1], strip_vertices[i+2]
@@ -406,21 +549,24 @@ class GL:
                     v0, v1, v2 = strip_vertices[i+1], strip_vertices[i], strip_vertices[i+2]
                 
                 # Projeta vértices
-                x0, y0, z0, w0 = GL._project_vertex(v0)
-                x1, y1, z1, w1 = GL._project_vertex(v1)
-                x2, y2, z2, w2 = GL._project_vertex(v2)
+                x0, y0, z0, w0, world_pos0 = GL._project_vertex(v0)
+                x1, y1, z1, w1, world_pos1 = GL._project_vertex(v1)
+                x2, y2, z2, w2, world_pos2 = GL._project_vertex(v2)
                 
                 # Verifica se está dentro do volume de visualização
                 if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                     max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                    GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                    GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                         None, w0, w1, w2, 1.0, None, None,
+                                         world_pos0, world_pos1, world_pos2, colors)
             
             point_idx += strip_size * 3  # Move para próxima strip
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
         """Função usada para renderizar IndexedTriangleStripSet 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         # Converte pontos em array de vértices
         vertices = []
@@ -444,14 +590,16 @@ class GL:
                         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
                         
                         # Projeta vértices
-                        x0, y0, z0, w0 = GL._project_vertex(v0)
-                        x1, y1, z1, w1 = GL._project_vertex(v1)
-                        x2, y2, z2, w2 = GL._project_vertex(v2)
+                        x0, y0, z0, w0, world_pos0 = GL._project_vertex(v0)
+                        x1, y1, z1, w1, world_pos1 = GL._project_vertex(v1)
+                        x2, y2, z2, w2, world_pos2 = GL._project_vertex(v2)
                         
-                        # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+                        # Verifica se pelo menos uma parte do triângulo está visível
                         if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                             max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                                 None, w0, w1, w2, 1.0, None, None,
+                                                 world_pos0, world_pos1, world_pos2, colors)
                 
                 current_strip = []  # Reinicia para próxima strip
             else:
@@ -461,7 +609,8 @@ class GL:
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
                        texCoord, texCoordIndex, colors, current_texture):
         """Função usada para renderizar IndexedFaceSet 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         # Obtém transparência
         transparency = colors.get("transparency", 0.0)
@@ -484,11 +633,8 @@ class GL:
         texture_data = None
         if current_texture and len(current_texture) > 0:
             try:
-                print(f"DEBUG: Tentando carregar textura: {current_texture[0]}")
                 image_texture = gpu.GPU.load_texture(current_texture[0])
-                print(f"DEBUG: Textura carregada com dimensões: {image_texture.shape}")
                 texture_data = GL._generate_mipmap(image_texture)
-                print(f"DEBUG: Mipmap gerado com {len(texture_data)} níveis")
             except Exception as e:
                 print(f"DEBUG: Erro ao carregar textura: {e}")
                 texture_data = None
@@ -509,7 +655,6 @@ class GL:
             if idx == -1:  # Fim de uma face
                 if len(current_face) >= 3:
                     # Triangula a face usando fan triangulation
-                    # Conecta o primeiro vértice com todos os pares consecutivos
                     for i in range(1, len(current_face) - 1):
                         i0 = current_face[0]      # Vértice central
                         i1 = current_face[i]      # Vértice atual
@@ -518,9 +663,9 @@ class GL:
                         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
                         
                         # Projeta vértices
-                        x0, y0, z0, w0 = GL._project_vertex(v0)
-                        x1, y1, z1, w1 = GL._project_vertex(v1)
-                        x2, y2, z2, w2 = GL._project_vertex(v2)
+                        x0, y0, z0, w0, world_pos0 = GL._project_vertex(v0)
+                        x1, y1, z1, w1, world_pos1 = GL._project_vertex(v1)
+                        x2, y2, z2, w2, world_pos2 = GL._project_vertex(v2)
                         
                         # Prepara cores do triângulo
                         triangle_colors = None
@@ -543,19 +688,18 @@ class GL:
                             t1_idx = current_tex_indices[i] if i < len(current_tex_indices) and current_tex_indices[i] < len(tex_vertices) else 0
                             t2_idx = current_tex_indices[i + 1] if (i + 1) < len(current_tex_indices) and current_tex_indices[i + 1] < len(tex_vertices) else 0
                             triangle_texcoords = [tex_vertices[t0_idx], tex_vertices[t1_idx], tex_vertices[t2_idx]]
-                            print(f"DEBUG: Usando coordenadas de textura: {triangle_texcoords}")
                         elif tex_vertices and not texCoordIndex:
                             # Usa coordenadas como índices de textura quando não há texCoordIndex
                             if i0 < len(tex_vertices) and i1 < len(tex_vertices) and i2 < len(tex_vertices):
                                 triangle_texcoords = [tex_vertices[i0], tex_vertices[i1], tex_vertices[i2]]
-                                print(f"DEBUG: Usando coordenadas de textura diretas: {triangle_texcoords}")
                         
-                        # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+                        # Verifica se pelo menos uma parte do triângulo está visível
                         if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                             max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
                             GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
                                                  triangle_colors, w0, w1, w2, alpha, 
-                                                 texture_data, triangle_texcoords)
+                                                 texture_data, triangle_texcoords,
+                                                 world_pos0, world_pos1, world_pos2, colors)
                 
                 current_face = []  # Reinicia para próxima face
                 current_color_indices = []
@@ -572,11 +716,11 @@ class GL:
                     if texCoordIndex[coord_idx] != -1:
                         current_tex_indices.append(texCoordIndex[coord_idx])
 
+    # ---------- Funções de geometria primitiva ----------
+    
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
         """Função usada para configurar o viewpoint (câmera)."""
-        # print(f"DEBUG Viewpoint: position={position}, orientation={orientation}, fov={fieldOfView}")
-        
         GL.camera_position = position
         GL.camera_orientation = orientation
         GL.camera_fov = fieldOfView
@@ -587,9 +731,6 @@ class GL:
         # Atualiza matriz de projeção
         aspect = GL.width / GL.height
         GL.projection_matrix = GL._create_perspective_matrix(fieldOfView, aspect, GL.near, GL.far)
-        
-        # print(f"DEBUG View matrix:\n{GL.view_matrix}")
-        # print(f"DEBUG Projection matrix:\n{GL.projection_matrix}")
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -633,10 +774,13 @@ class GL:
         else:
             GL.model_matrix = np.eye(4)
 
+    # ---------- Implementações das primitivas geométricas ----------
+    
     @staticmethod
     def box(size, colors):
         """Função usada para renderizar Box 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         # Dimensões da caixa
         sx, sy, sz = size[0]/2, size[1]/2, size[2]/2
@@ -674,19 +818,22 @@ class GL:
             v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
             
             # Projeta vértices
-            x0, y0, z0, w0 = GL._project_vertex(v0)
-            x1, y1, z1, w1 = GL._project_vertex(v1)
-            x2, y2, z2, w2 = GL._project_vertex(v2)
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(v0)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(v1)
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(v2)
             
-            # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+            # Verifica se pelo menos uma parte do triângulo está visível
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
 
     @staticmethod
     def sphere(radius, colors):
         """Função usada para renderizar Sphere 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         # Parâmetros da esfera
         slices = 16  # Divisões longitudinais
@@ -716,29 +863,33 @@ class GL:
                 
                 # Primeiro triângulo
                 if i > 0:  # Evita triângulos degenerados no polo
-                    x0, y0, z0, w0 = GL._project_vertex(vertices[v0])
-                    x1, y1, z1, w1 = GL._project_vertex(vertices[v1])
-                    x2, y2, z2, w2 = GL._project_vertex(vertices[v2])
+                    x0, y0, z0, w0, world_pos0 = GL._project_vertex(vertices[v0])
+                    x1, y1, z1, w1, world_pos1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2, w2, world_pos2 = GL._project_vertex(vertices[v2])
                     
                     if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                         max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                        GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                        GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                             None, w0, w1, w2, 1.0, None, None,
+                                             world_pos0, world_pos1, world_pos2, colors)
                 
                 # Segundo triângulo
                 if i < stacks - 1:  # Evita triângulos degenerados no polo
-                    x1, y1, z1, w1 = GL._project_vertex(vertices[v1])
-                    x2, y2, z2, w2 = GL._project_vertex(vertices[v2])
-                    x3, y3, z3, w3 = GL._project_vertex(vertices[v3])
+                    x1, y1, z1, w1, world_pos1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2, w2, world_pos2 = GL._project_vertex(vertices[v2])
+                    x3, y3, z3, w3, world_pos3 = GL._project_vertex(vertices[v3])
                     
-                    if (0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                        0 <= x2 < GL.width and 0 <= y2 < GL.height and
-                        0 <= x3 < GL.width and 0 <= y3 < GL.height):
-                        GL._rasterize_triangle(x1, y1, z1, x3, y3, z3, x2, y2, z2, col, None, w1, w3, w2)
+                    if (max(x1, x2, x3) >= 0 and min(x1, x2, x3) < GL.width and
+                        max(y1, y2, y3) >= 0 and min(y1, y2, y3) < GL.height):
+                        GL._rasterize_triangle(x1, y1, z1, x3, y3, z3, x2, y2, z2, col, 
+                                             None, w1, w3, w2, 1.0, None, None,
+                                             world_pos1, world_pos3, world_pos2, colors)
 
     @staticmethod
     def cone(bottomRadius, height, colors):
         """Função usada para renderizar Cone 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         sides = 16  # Número de lados do cone
         
@@ -760,28 +911,33 @@ class GL:
         for i in range(sides):
             next_i = (i + 1) % sides
             
-            x0, y0, z0, w0 = GL._project_vertex(top)
-            x1, y1, z1, w1 = GL._project_vertex(base_vertices[i])
-            x2, y2, z2, w2 = GL._project_vertex(base_vertices[next_i])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(top)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(base_vertices[i])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(base_vertices[next_i])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
         
         # Base do cone
         for i in range(1, sides - 1):
-            x0, y0, z0, w0 = GL._project_vertex(center)
-            x1, y1, z1, w1 = GL._project_vertex(base_vertices[0])
-            x2, y2, z2, w2 = GL._project_vertex(base_vertices[i])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(center)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(base_vertices[0])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(base_vertices[i])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
 
     @staticmethod
     def cylinder(radius, height, colors):
         """Função usada para renderizar Cylinder 3D."""
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         
         sides = 16  # Número de lados do cilindro
         
@@ -804,48 +960,57 @@ class GL:
             next_i = (i + 1) % sides
             
             # Primeiro triângulo da face lateral
-            x0, y0, z0, w0 = GL._project_vertex(bottom_vertices[i])
-            x1, y1, z1, w1 = GL._project_vertex(top_vertices[i])
-            x2, y2, z2, w2 = GL._project_vertex(top_vertices[next_i])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(top_vertices[i])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(top_vertices[next_i])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
             
             # Segundo triângulo da face lateral
-            x0, y0, z0, w0 = GL._project_vertex(bottom_vertices[i])
-            x1, y1, z1, w1 = GL._project_vertex(top_vertices[next_i])
-            x2, y2, z2, w2 = GL._project_vertex(bottom_vertices[next_i])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(top_vertices[next_i])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(bottom_vertices[next_i])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
         
         # Tampa superior
         for i in range(1, sides - 1):
-            x0, y0, z0, w0 = GL._project_vertex(top_center)
-            x1, y1, z1, w1 = GL._project_vertex(top_vertices[0])
-            x2, y2, z2, w2 = GL._project_vertex(top_vertices[i + 1])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(top_center)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(top_vertices[0])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(top_vertices[i + 1])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
         
         # Tampa inferior
         for i in range(1, sides - 1):
-            x0, y0, z0, w0 = GL._project_vertex(bottom_center)
-            x1, y1, z1, w1 = GL._project_vertex(bottom_vertices[0])
-            x2, y2, z2, w2 = GL._project_vertex(bottom_vertices[i])
+            x0, y0, z0, w0, world_pos0 = GL._project_vertex(bottom_center)
+            x1, y1, z1, w1, world_pos1 = GL._project_vertex(bottom_vertices[0])
+            x2, y2, z2, w2, world_pos2 = GL._project_vertex(bottom_vertices[i])
             
             if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
                 max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                     None, w0, w1, w2, 1.0, None, None,
+                                     world_pos0, world_pos1, world_pos2, colors)
 
-    # ---------- Implementações 2D existentes ----------
+    # ---------- Implementações 2D existentes (mantenha as originais) ----------
     
     @staticmethod
     def polypoint2D(point, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         for i in range(0, len(point), 2):
             u = int(round(point[i]))
             v = int(round(point[i+1]))
@@ -853,7 +1018,8 @@ class GL:
 
     @staticmethod
     def polyline2D(lineSegments, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         if len(lineSegments) < 4:
             return
         for i in range(0, len(lineSegments)-2, 2):
@@ -882,7 +1048,8 @@ class GL:
 
     @staticmethod
     def circle2D(radius, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         cx, cy = 0.0, 0.0
         step = 1
         x_prev = cx + radius * math.sin(math.radians(0))
@@ -895,7 +1062,8 @@ class GL:
 
     @staticmethod
     def triangleSet2D(vertices, colors):
-        col = GL._rgb8(colors.get("emissiveColor"))
+        col = GL._get_base_color(colors)
+
         for t in range(0, len(vertices), 6):
             x0, y0 = vertices[t], vertices[t+1]
             x1, y1 = vertices[t+2], vertices[t+3]
@@ -922,37 +1090,40 @@ class GL:
                     if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
                         gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, col)
 
-    # ---------- Funções não implementadas ou auxiliares ----------
-        
-    @staticmethod
-    def navigationInfo(headlight):
-        # print("NavigationInfo não implementado ainda")
-        return 0
-        
-    @staticmethod
-    def directionalLight(ambientIntensity, color, intensity, direction):
-        print("DirectionalLight não implementado ainda")
+    # ---------- Funções auxiliares ----------
         
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
-        print("PointLight não implementado ainda")
-        
+        """Define uma luz pontual."""
+        GL.useLighting = True
+        GL.lights.append({
+            "type": "point",
+            "ambientIntensity": ambientIntensity,
+            "color": color,
+            "intensity": intensity,
+            "location": np.array(location)
+        })
+
     @staticmethod
     def fog(visibilityRange, color):
         print("Fog não implementado ainda")
-        
-    @staticmethod
-    def timeSensor(cycleInterval, loop):
-        epoch = time.time()
-        fraction_changed = (epoch % cycleInterval) / cycleInterval
-        return fraction_changed
-        
-    @staticmethod
-    def splinePositionInterpolator(set_fraction, key, keyValue, closed):
-        print("SplinePositionInterpolator não implementado ainda")
-        return [0.0, 0.0, 0.0]
-        
+            
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
-        print("OrientationInterpolator não implementado ainda")
-        return [0, 0, 1, 0]
+        """Interpolador de orientação (linear simplificado)."""
+        if not key or not keyValue:
+            return [0, 0, 1, 0]
+
+        fraction = max(0.0, min(1.0, set_fraction))
+        for i in range(len(key) - 1):
+            if fraction <= key[i + 1]:
+                t = (fraction - key[i]) / (key[i + 1] - key[i])
+                idx0, idx1 = i * 4, (i + 1) * 4
+                axis_x = keyValue[idx0] + t * (keyValue[idx1] - keyValue[idx0])
+                axis_y = keyValue[idx0 + 1] + t * (keyValue[idx1 + 1] - keyValue[idx0 + 1])
+                axis_z = keyValue[idx0 + 2] + t * (keyValue[idx1 + 2] - keyValue[idx0 + 2])
+                angle  = keyValue[idx0 + 3] + t * (keyValue[idx1 + 3] - keyValue[idx0 + 3])
+                return [axis_x, axis_y, axis_z, angle]
+
+        last_idx = (len(key) - 1) * 4
+        return [keyValue[last_idx], keyValue[last_idx+1], keyValue[last_idx+2], keyValue[last_idx+3]]
