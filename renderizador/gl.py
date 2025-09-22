@@ -58,6 +58,89 @@ class GL:
     @staticmethod
     def _edge(ax, ay, bx, by, px, py):
         return (px-ax)*(by-ay) - (py-ay)*(bx-ax)
+    
+    @staticmethod
+    def _sample_texture(texture, u, v, use_mipmap=True):
+        """Amostra uma textura nas coordenadas (u, v) com suporte a Mipmap."""
+        if texture is None:
+            return None
+            
+        # Verifica se é um mipmap (lista de níveis) ou textura simples
+        if isinstance(texture, list) and use_mipmap:
+            # Calcula nível de Mipmap baseado em derivadas aproximadas
+            # Para simplificar, usa o nível 0 para texturas próximas e níveis maiores para distantes
+            mip_level = 0  # Por simplicidade, sempre usa nível 0
+            if mip_level >= len(texture):
+                mip_level = len(texture) - 1
+            current_texture = texture[mip_level]
+        else:
+            current_texture = texture if not isinstance(texture, list) else texture[0]
+        
+        if current_texture is None or len(current_texture.shape) < 2:
+            return None
+            
+        height, width = current_texture.shape[:2]
+        
+        # Normaliza coordenadas de textura para [0, 1]
+        u = u - math.floor(u)  # Wrap
+        v = v - math.floor(v)  # Wrap
+        
+        # Converte para coordenadas de pixel
+        tex_x = int(u * (width - 1))
+        tex_y = int(v * (height - 1))
+        
+        # Clampeia dentro dos limites
+        tex_x = max(0, min(width - 1, tex_x))
+        tex_y = max(0, min(height - 1, tex_y))
+        
+        # Retorna cor do pixel
+        if len(current_texture.shape) == 3:  # RGB
+            return [max(0, min(255, int(current_texture[tex_y, tex_x, 0]))), 
+                   max(0, min(255, int(current_texture[tex_y, tex_x, 1]))), 
+                   max(0, min(255, int(current_texture[tex_y, tex_x, 2])))]
+        else:  # Grayscale
+            val = max(0, min(255, int(current_texture[tex_y, tex_x])))
+            return [val, val, val]
+    
+    @staticmethod
+    def _generate_mipmap(texture):
+        """Gera níveis de Mipmap para uma textura."""
+        if texture is None:
+            return None
+            
+        mipmaps = [texture]
+        current = texture
+        
+        # Gera níveis menores até chegar a 1x1
+        while current.shape[0] > 1 or current.shape[1] > 1:
+            # Reduz pela metade usando downsampling simples
+            new_height = max(1, current.shape[0] // 2)
+            new_width = max(1, current.shape[1] // 2)
+            
+            if len(current.shape) == 3:  # RGB
+                new_level = np.zeros((new_height, new_width, current.shape[2]), dtype=current.dtype)
+                for y in range(new_height):
+                    for x in range(new_width):
+                        # Amostra 2x2 pixels e calcula média
+                        y0, y1 = y * 2, min(y * 2 + 1, current.shape[0] - 1)
+                        x0, x1 = x * 2, min(x * 2 + 1, current.shape[1] - 1)
+                        
+                        new_level[y, x] = (current[y0, x0] + current[y0, x1] + 
+                                         current[y1, x0] + current[y1, x1]) / 4
+            else:  # Grayscale
+                new_level = np.zeros((new_height, new_width), dtype=current.dtype)
+                for y in range(new_height):
+                    for x in range(new_width):
+                        y0, y1 = y * 2, min(y * 2 + 1, current.shape[0] - 1)
+                        x0, x1 = x * 2, min(x * 2 + 1, current.shape[1] - 1)
+                        
+                        new_level[y, x] = (current[y0, x0] + current[y0, x1] + 
+                                         current[y1, x0] + current[y1, x1]) / 4
+            
+            mipmaps.append(new_level.astype(current.dtype))
+            current = new_level
+            
+        return mipmaps
 
     @staticmethod
     def _create_rotation_matrix(axis, angle):
@@ -139,6 +222,9 @@ class GL:
         # Aplica projeção perspectiva
         v_clip = GL.projection_matrix @ v_view
         
+        # Salva W antes da divisão perspectiva para correção de perspectiva
+        w_clip = v_clip[3] if v_clip[3] != 0 else 1.0
+        
         # Divisão perspectiva
         if v_clip[3] != 0:
             v_ndc = v_clip / v_clip[3]
@@ -149,11 +235,11 @@ class GL:
         x_screen = (v_ndc[0] + 1) * GL.width / 2
         y_screen = (1 - v_ndc[1]) * GL.height / 2
         
-        return x_screen, y_screen, v_ndc[2]
+        return x_screen, y_screen, v_ndc[2], w_clip
 
     @staticmethod
-    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color):
-        """Rasteriza um triângulo com test de profundidade simples."""
+    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color, colors=None, w0_3d=None, w1_3d=None, w2_3d=None, transparency=1.0, texture=None, texcoords=None):
+        """Rasteriza um triângulo com test de profundidade, interpolação de cores, transparência e textura."""
         # Converte para inteiros
         x0, y0 = int(round(x0)), int(round(y0))
         x1, y1 = int(round(x1)), int(round(y1))
@@ -195,9 +281,74 @@ class GL:
 
                 # lê z atual e compara
                 z_curr = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                if z_depth < z_curr:
+                
+                # Para objetos transparentes, sempre renderiza sem atualizar z-buffer
+                # Para objetos opacos, só renderiza se estiver na frente
+                should_render = False
+                if transparency < 1.0:
+                    # Objeto transparente - sempre renderiza, mas não atualiza z-buffer
+                    should_render = True
+                elif z_depth < z_curr:
+                    # Objeto opaco na frente - renderiza e atualiza z-buffer
+                    should_render = True
                     gpu.GPU.draw_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F, [z_depth])
-                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, color)
+                
+                if should_render:
+                    # Calcula cor final
+                    final_color = color
+                    
+                    # Interpolação de cor com correção de perspectiva
+                    if colors and w0_3d is not None and w1_3d is not None and w2_3d is not None:
+                        # Correção de perspectiva usando coordenadas W do espaço 3D
+                        alpha_corrected = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        beta_corrected = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        gamma_corrected = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        
+                        # Interpola cores
+                        r = int(alpha_corrected * colors[0][0] + beta_corrected * colors[1][0] + gamma_corrected * colors[2][0])
+                        g = int(alpha_corrected * colors[0][1] + beta_corrected * colors[1][1] + gamma_corrected * colors[2][1])
+                        b = int(alpha_corrected * colors[0][2] + beta_corrected * colors[1][2] + gamma_corrected * colors[2][2])
+                        
+                        final_color = [max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))]
+                    
+                    # Aplicação de textura
+                    if texture is not None and texcoords is not None:
+                        # Interpolação de coordenadas de textura com correção de perspectiva
+                        if w0_3d is not None and w1_3d is not None and w2_3d is not None:
+                            alpha_tex = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                            beta_tex = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                            gamma_tex = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        else:
+                            alpha_tex, beta_tex, gamma_tex = alpha, beta, gamma
+                            
+                        # Interpola coordenadas de textura
+                        u = alpha_tex * texcoords[0][0] + beta_tex * texcoords[1][0] + gamma_tex * texcoords[2][0]
+                        v = alpha_tex * texcoords[0][1] + beta_tex * texcoords[1][1] + gamma_tex * texcoords[2][1]
+                        
+                        # Amostra textura
+                        tex_color = GL._sample_texture(texture, u, v)
+                        if tex_color:
+                            # Multiplica cor base pela textura
+                            final_color = [
+                                int((final_color[0] / 255.0) * tex_color[0]),
+                                int((final_color[1] / 255.0) * tex_color[1]),
+                                int((final_color[2] / 255.0) * tex_color[2])
+                            ]
+                    
+                    # Aplicação de transparência (alpha blending)
+                    if transparency < 1.0:
+                        # Lê cor atual do pixel
+                        bg_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
+                        if bg_color is not None:
+                            # Alpha blending: C_final = (1-transparency) * C_novo + transparency * C_antigo
+                            alpha_blend = 1.0 - transparency  # alpha é opacidade, não transparência
+                            final_color = [
+                                int(alpha_blend * final_color[0] + transparency * bg_color[0]),
+                                int(alpha_blend * final_color[1] + transparency * bg_color[1]),
+                                int(alpha_blend * final_color[2] + transparency * bg_color[2])
+                            ]
+                    
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, final_color)
 
 
     # ---------- Implementações principais ----------
@@ -207,6 +358,10 @@ class GL:
         """Função usada para renderizar TriangleSet 3D."""
         col = GL._rgb8(colors.get("emissiveColor"))
         
+        # Obtém transparência
+        transparency = colors.get("transparency", 0.0)
+        alpha = 1.0 - transparency
+        
         # Processa triângulos (cada 9 valores = 3 vértices de 3 coordenadas)
         for t in range(0, len(point), 9):
             # Vértices do triângulo
@@ -215,15 +370,14 @@ class GL:
             v2 = np.array([point[t+6], point[t+7], point[t+8], 1.0])
             
             # Projeta vértices
-            x0, y0, z0 = GL._project_vertex(v0)
-            x1, y1, z1 = GL._project_vertex(v1)
-            x2, y2, z2 = GL._project_vertex(v2)
+            x0, y0, z0, w0 = GL._project_vertex(v0)
+            x1, y1, z1, w1 = GL._project_vertex(v1)
+            x2, y2, z2, w2 = GL._project_vertex(v2)
             
-            # Verifica se está dentro do volume de visualização
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2, alpha)
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
@@ -258,15 +412,14 @@ class GL:
                     v0, v1, v2 = strip_vertices[i+1], strip_vertices[i], strip_vertices[i+2]
                 
                 # Projeta vértices
-                x0, y0, z0 = GL._project_vertex(v0)
-                x1, y1, z1 = GL._project_vertex(v1)
-                x2, y2, z2 = GL._project_vertex(v2)
+                x0, y0, z0, w0 = GL._project_vertex(v0)
+                x1, y1, z1, w1 = GL._project_vertex(v1)
+                x2, y2, z2, w2 = GL._project_vertex(v2)
                 
                 # Verifica se está dentro do volume de visualização
-                if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                    0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                    0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                    GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                    max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                    GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
             
             point_idx += strip_size * 3  # Move para próxima strip
 
@@ -297,15 +450,14 @@ class GL:
                         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
                         
                         # Projeta vértices
-                        x0, y0, z0 = GL._project_vertex(v0)
-                        x1, y1, z1 = GL._project_vertex(v1)
-                        x2, y2, z2 = GL._project_vertex(v2)
+                        x0, y0, z0, w0 = GL._project_vertex(v0)
+                        x1, y1, z1, w1 = GL._project_vertex(v1)
+                        x2, y2, z2, w2 = GL._project_vertex(v2)
                         
-                        # Verifica se está dentro do volume de visualização
-                        if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                            0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                            0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                        # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+                        if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                            max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
                 
                 current_strip = []  # Reinicia para próxima strip
             else:
@@ -317,16 +469,49 @@ class GL:
         """Função usada para renderizar IndexedFaceSet 3D."""
         col = GL._rgb8(colors.get("emissiveColor"))
         
+        # Obtém transparência
+        transparency = colors.get("transparency", 0.0)
+        alpha = 1.0 - transparency
+        
         # Converte coordenadas em array de vértices
         vertices = []
         for i in range(0, len(coord), 3):
             v = np.array([coord[i], coord[i+1], coord[i+2], 1.0])
             vertices.append(v)
         
+        # Converte coordenadas de textura se disponível
+        tex_vertices = None
+        if texCoord and len(texCoord) > 0:
+            tex_vertices = []
+            for i in range(0, len(texCoord), 2):
+                tex_vertices.append([texCoord[i], texCoord[i+1]])
+        
+        # Carrega e gera mipmap da textura se disponível
+        texture_data = None
+        if current_texture and len(current_texture) > 0:
+            try:
+                print(f"DEBUG: Tentando carregar textura: {current_texture[0]}")
+                image_texture = gpu.GPU.load_texture(current_texture[0])
+                print(f"DEBUG: Textura carregada com dimensões: {image_texture.shape}")
+                texture_data = GL._generate_mipmap(image_texture)
+                print(f"DEBUG: Mipmap gerado com {len(texture_data)} níveis")
+            except Exception as e:
+                print(f"DEBUG: Erro ao carregar textura: {e}")
+                texture_data = None
+        
+        # Converte cores por vértice se disponível
+        vertex_colors = None
+        if colorPerVertex and color and len(color) > 0:
+            vertex_colors = []
+            for i in range(0, len(color), 3):
+                vertex_colors.append(GL._rgb8([color[i], color[i+1], color[i+2]]))
+        
         # Processa índices para formar faces
         current_face = []
+        current_color_indices = []
+        current_tex_indices = []
         
-        for idx in coordIndex:
+        for coord_idx, idx in enumerate(coordIndex):
             if idx == -1:  # Fim de uma face
                 if len(current_face) >= 3:
                     # Triangula a face usando fan triangulation
@@ -339,19 +524,59 @@ class GL:
                         v0, v1, v2 = vertices[i0], vertices[i1], vertices[i2]
                         
                         # Projeta vértices
-                        x0, y0, z0 = GL._project_vertex(v0)
-                        x1, y1, z1 = GL._project_vertex(v1)
-                        x2, y2, z2 = GL._project_vertex(v2)
+                        x0, y0, z0, w0 = GL._project_vertex(v0)
+                        x1, y1, z1, w1 = GL._project_vertex(v1)
+                        x2, y2, z2, w2 = GL._project_vertex(v2)
                         
-                        # Verifica se está dentro do volume de visualização
-                        if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                            0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                            0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                        # Prepara cores do triângulo
+                        triangle_colors = None
+                        if vertex_colors and colorIndex and len(current_color_indices) >= len(current_face):
+                            # Usa índices de cor específicos
+                            c0_idx = current_color_indices[0] if current_color_indices[0] < len(vertex_colors) else 0
+                            c1_idx = current_color_indices[i] if i < len(current_color_indices) and current_color_indices[i] < len(vertex_colors) else 0
+                            c2_idx = current_color_indices[i + 1] if (i + 1) < len(current_color_indices) and current_color_indices[i + 1] < len(vertex_colors) else 0
+                            triangle_colors = [vertex_colors[c0_idx], vertex_colors[c1_idx], vertex_colors[c2_idx]]
+                        elif vertex_colors and not colorIndex:
+                            # Usa coordenadas como índices de cor quando não há colorIndex
+                            if i0 < len(vertex_colors) and i1 < len(vertex_colors) and i2 < len(vertex_colors):
+                                triangle_colors = [vertex_colors[i0], vertex_colors[i1], vertex_colors[i2]]
+                        
+                        # Prepara coordenadas de textura do triângulo
+                        triangle_texcoords = None
+                        if tex_vertices and texCoordIndex and len(current_tex_indices) >= len(current_face):
+                            # Usa índices de textura específicos
+                            t0_idx = current_tex_indices[0] if current_tex_indices[0] < len(tex_vertices) else 0
+                            t1_idx = current_tex_indices[i] if i < len(current_tex_indices) and current_tex_indices[i] < len(tex_vertices) else 0
+                            t2_idx = current_tex_indices[i + 1] if (i + 1) < len(current_tex_indices) and current_tex_indices[i + 1] < len(tex_vertices) else 0
+                            triangle_texcoords = [tex_vertices[t0_idx], tex_vertices[t1_idx], tex_vertices[t2_idx]]
+                            print(f"DEBUG: Usando coordenadas de textura: {triangle_texcoords}")
+                        elif tex_vertices and not texCoordIndex:
+                            # Usa coordenadas como índices de textura quando não há texCoordIndex
+                            if i0 < len(tex_vertices) and i1 < len(tex_vertices) and i2 < len(tex_vertices):
+                                triangle_texcoords = [tex_vertices[i0], tex_vertices[i1], tex_vertices[i2]]
+                                print(f"DEBUG: Usando coordenadas de textura diretas: {triangle_texcoords}")
+                        
+                        # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+                        if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                            max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                            GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, 
+                                                 triangle_colors, w0, w1, w2, alpha, 
+                                                 texture_data, triangle_texcoords)
                 
                 current_face = []  # Reinicia para próxima face
+                current_color_indices = []
+                current_tex_indices = []
             else:
                 current_face.append(idx)
+                # Para colorIndex, coleta índices de cor na mesma posição
+                if colorIndex and coord_idx < len(colorIndex):
+                    if colorIndex[coord_idx] != -1:
+                        current_color_indices.append(colorIndex[coord_idx])
+                    
+                # Para texCoordIndex, coleta índices de textura na mesma posição
+                if texCoordIndex and coord_idx < len(texCoordIndex):
+                    if texCoordIndex[coord_idx] != -1:
+                        current_tex_indices.append(texCoordIndex[coord_idx])
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -455,15 +680,14 @@ class GL:
             v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
             
             # Projeta vértices
-            x0, y0, z0 = GL._project_vertex(v0)
-            x1, y1, z1 = GL._project_vertex(v1)
-            x2, y2, z2 = GL._project_vertex(v2)
+            x0, y0, z0, w0 = GL._project_vertex(v0)
+            x1, y1, z1, w1 = GL._project_vertex(v1)
+            x2, y2, z2, w2 = GL._project_vertex(v2)
             
-            # Verifica se está dentro do volume de visualização
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            # Verifica se pelo menos uma parte do triângulo está visível (bounds mais permissivo)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
 
     @staticmethod
     def sphere(radius, colors):
@@ -498,25 +722,24 @@ class GL:
                 
                 # Primeiro triângulo
                 if i > 0:  # Evita triângulos degenerados no polo
-                    x0, y0, z0 = GL._project_vertex(vertices[v0])
-                    x1, y1, z1 = GL._project_vertex(vertices[v1])
-                    x2, y2, z2 = GL._project_vertex(vertices[v2])
+                    x0, y0, z0, w0 = GL._project_vertex(vertices[v0])
+                    x1, y1, z1, w1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2, w2 = GL._project_vertex(vertices[v2])
                     
-                    if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                        0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                        0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                        GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+                    if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                        max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                        GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
                 
                 # Segundo triângulo
                 if i < stacks - 1:  # Evita triângulos degenerados no polo
-                    x1, y1, z1 = GL._project_vertex(vertices[v1])
-                    x2, y2, z2 = GL._project_vertex(vertices[v2])
-                    x3, y3, z3 = GL._project_vertex(vertices[v3])
+                    x1, y1, z1, w1 = GL._project_vertex(vertices[v1])
+                    x2, y2, z2, w2 = GL._project_vertex(vertices[v2])
+                    x3, y3, z3, w3 = GL._project_vertex(vertices[v3])
                     
                     if (0 <= x1 < GL.width and 0 <= y1 < GL.height and
                         0 <= x2 < GL.width and 0 <= y2 < GL.height and
                         0 <= x3 < GL.width and 0 <= y3 < GL.height):
-                        GL._rasterize_triangle(x1, y1, z1, x3, y3, z3, x2, y2, z2, col)
+                        GL._rasterize_triangle(x1, y1, z1, x3, y3, z3, x2, y2, z2, col, None, w1, w3, w2)
 
     @staticmethod
     def cone(bottomRadius, height, colors):
@@ -543,25 +766,23 @@ class GL:
         for i in range(sides):
             next_i = (i + 1) % sides
             
-            x0, y0, z0 = GL._project_vertex(top)
-            x1, y1, z1 = GL._project_vertex(base_vertices[i])
-            x2, y2, z2 = GL._project_vertex(base_vertices[next_i])
+            x0, y0, z0, w0 = GL._project_vertex(top)
+            x1, y1, z1, w1 = GL._project_vertex(base_vertices[i])
+            x2, y2, z2, w2 = GL._project_vertex(base_vertices[next_i])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
         
         # Base do cone
         for i in range(1, sides - 1):
-            x0, y0, z0 = GL._project_vertex(center)
-            x1, y1, z1 = GL._project_vertex(base_vertices[0])
-            x2, y2, z2 = GL._project_vertex(base_vertices[i])
+            x0, y0, z0, w0 = GL._project_vertex(center)
+            x1, y1, z1, w1 = GL._project_vertex(base_vertices[0])
+            x2, y2, z2, w2 = GL._project_vertex(base_vertices[i])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
 
     @staticmethod
     def cylinder(radius, height, colors):
@@ -589,46 +810,42 @@ class GL:
             next_i = (i + 1) % sides
             
             # Primeiro triângulo da face lateral
-            x0, y0, z0 = GL._project_vertex(bottom_vertices[i])
-            x1, y1, z1 = GL._project_vertex(top_vertices[i])
-            x2, y2, z2 = GL._project_vertex(top_vertices[next_i])
+            x0, y0, z0, w0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1, w1 = GL._project_vertex(top_vertices[i])
+            x2, y2, z2, w2 = GL._project_vertex(top_vertices[next_i])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
             
             # Segundo triângulo da face lateral
-            x0, y0, z0 = GL._project_vertex(bottom_vertices[i])
-            x1, y1, z1 = GL._project_vertex(top_vertices[next_i])
-            x2, y2, z2 = GL._project_vertex(bottom_vertices[next_i])
+            x0, y0, z0, w0 = GL._project_vertex(bottom_vertices[i])
+            x1, y1, z1, w1 = GL._project_vertex(top_vertices[next_i])
+            x2, y2, z2, w2 = GL._project_vertex(bottom_vertices[next_i])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
         
         # Tampa superior
         for i in range(1, sides - 1):
-            x0, y0, z0 = GL._project_vertex(top_center)
-            x1, y1, z1 = GL._project_vertex(top_vertices[0])
-            x2, y2, z2 = GL._project_vertex(top_vertices[i + 1])
+            x0, y0, z0, w0 = GL._project_vertex(top_center)
+            x1, y1, z1, w1 = GL._project_vertex(top_vertices[0])
+            x2, y2, z2, w2 = GL._project_vertex(top_vertices[i + 1])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
         
         # Tampa inferior
         for i in range(1, sides - 1):
-            x0, y0, z0 = GL._project_vertex(bottom_center)
-            x1, y1, z1 = GL._project_vertex(bottom_vertices[0])
-            x2, y2, z2 = GL._project_vertex(bottom_vertices[i])
+            x0, y0, z0, w0 = GL._project_vertex(bottom_center)
+            x1, y1, z1, w1 = GL._project_vertex(bottom_vertices[0])
+            x2, y2, z2, w2 = GL._project_vertex(bottom_vertices[i])
             
-            if (0 <= x0 < GL.width and 0 <= y0 < GL.height and
-                0 <= x1 < GL.width and 0 <= y1 < GL.height and
-                0 <= x2 < GL.width and 0 <= y2 < GL.height):
-                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col)
+            if (max(x0, x1, x2) >= 0 and min(x0, x1, x2) < GL.width and
+                max(y0, y1, y2) >= 0 and min(y0, y1, y2) < GL.height):
+                GL._rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, col, None, w0, w1, w2)
 
     # ---------- Implementações 2D existentes ----------
     

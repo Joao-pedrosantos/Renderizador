@@ -39,6 +39,11 @@ class Renderizador:
     def setup(self):
         """Configura o sistema para a renderização."""
         # Configurando color buffers para exibição na tela
+        
+        # Configura superamostragem 2x2
+        self.supersample_factor = 2
+        self.render_width = self.width * self.supersample_factor
+        self.render_height = self.height * self.supersample_factor
 
         # Cria uma (1) posição de FrameBuffer na GPU
         fbo = gpu.GPU.gen_framebuffers(1)
@@ -55,22 +60,22 @@ class Renderizador:
 
         # Aloca memória no FrameBuffer para um tipo e tamanho especificado de buffer
 
-        # Memória de Framebuffer para canal de cores
+        # Memória de Framebuffer para canal de cores (com superamostragem)
         gpu.GPU.framebuffer_storage(
             self.framebuffers["FRONT"],
             gpu.GPU.COLOR_ATTACHMENT,
             gpu.GPU.RGB8,
-            self.width,
-            self.height
+            self.render_width,
+            self.render_height
         )
 
-        # Descomente as seguintes linhas se for usar um Framebuffer para profundidade
+        # Framebuffer para profundidade (com superamostragem)
         gpu.GPU.framebuffer_storage(
             self.framebuffers["FRONT"],
             gpu.GPU.DEPTH_ATTACHMENT,
             gpu.GPU.DEPTH_COMPONENT32F,
-            self.width,
-            self.height
+            self.render_width,
+            self.render_height
         )
     
         # Opções:
@@ -91,8 +96,8 @@ class Renderizador:
         # Assuma 1.0 o mais afastado e -1.0 o mais próximo da camera
         gpu.GPU.clear_depth(1.0)
 
-        # Definindo tamanho do Viewport para renderização
-        self.scene.viewport(width=self.width, height=self.height)
+        # Definindo tamanho do Viewport para renderização (com superamostragem)
+        self.scene.viewport(width=self.render_width, height=self.render_height)
 
     def pre(self):
         """Rotinas pré renderização."""
@@ -109,13 +114,49 @@ class Renderizador:
         """Rotinas pós renderização."""
         # Função invocada após o processo de renderização terminar.
 
-        # Essa é uma chamada conveniente para manipulação de buffers
-        # ao final da renderização de um frame. Como por exemplo, executar
-        # downscaling da imagem.
+        # Downscaling com anti-aliasing
+        self._downsample_buffer()
 
         # Método para a troca dos buffers (NÃO IMPLEMENTADO)
         # Esse método será utilizado na fase de implementação de animações
         gpu.GPU.swap_buffers()
+        
+    def _downsample_buffer(self):
+        """Faz downsampling do buffer de alta resolução para resolução final."""
+        import numpy as np
+        
+        # Obtém buffer de alta resolução
+        high_res_buffer = gpu.GPU.get_frame_buffer()
+        
+        # Cria buffer de saída com resolução final
+        final_buffer = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        
+        # Para cada pixel final, calcula média dos 4 pixels correspondentes
+        for y in range(self.height):
+            for x in range(self.width):
+                # Coordenadas no buffer de alta resolução
+                y_high = y * self.supersample_factor
+                x_high = x * self.supersample_factor
+                
+                # Coleta os 4 pixels e calcula média
+                pixel_sum = np.zeros(3, dtype=np.float32)
+                samples = 0
+                for dy in range(self.supersample_factor):
+                    for dx in range(self.supersample_factor):
+                        y_sample = y_high + dy
+                        x_sample = x_high + dx
+                        # Verifica se está dentro dos limites
+                        if (y_sample < high_res_buffer.shape[0] and 
+                            x_sample < high_res_buffer.shape[1]):
+                            pixel_sum += high_res_buffer[y_sample, x_sample].astype(np.float32)
+                            samples += 1
+                        
+                # Média dos pixels válidos
+                if samples > 0:
+                    final_buffer[y, x] = (pixel_sum / samples).astype(np.uint8)
+        
+        # Substitui o buffer atual pelo buffer final
+        gpu.GPU.frame_buffer[gpu.GPU.read_framebuffer].color = final_buffer
 
     def mapping(self):
         """Mapeamento de funções para as rotinas de renderização."""
