@@ -29,6 +29,7 @@ class GL:
     camera_position = [0, 0, 0]
     camera_orientation = [0, 0, 1, 0]
     camera_fov = math.pi/4
+    useLighting = False
 
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
@@ -37,6 +38,7 @@ class GL:
         GL.height = height
         GL.near = near
         GL.far = far
+        GL.useLighting = False
 
     # ---------- Funções de utilidade ----------
     @staticmethod
@@ -238,8 +240,10 @@ class GL:
         return x_screen, y_screen, v_ndc[2], w_clip
 
     @staticmethod
-    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color, colors=None, w0_3d=None, w1_3d=None, w2_3d=None, transparency=1.0, texture=None, texcoords=None):
-        """Rasteriza um triângulo com test de profundidade, interpolação de cores, transparência e textura."""
+    def _rasterize_triangle(x0, y0, z0, x1, y1, z1, x2, y2, z2,
+                            color, colors=None, w0_3d=None, w1_3d=None, w2_3d=None,
+                            transparency=1.0, texture=None, texcoords=None):
+        """Rasteriza um triângulo com teste de profundidade, interpolação de cores, transparência e textura."""
         # Converte para inteiros
         x0, y0 = int(round(x0)), int(round(y0))
         x1, y1 = int(round(x1)), int(round(y1))
@@ -256,7 +260,6 @@ class GL:
         if area <= 0:
             return
         
-        # Rasterização
         inv_area = 1.0 / area
         for y in range(miny, maxy+1):
             for x in range(minx, maxx+1):
@@ -269,86 +272,77 @@ class GL:
                 if not inside:
                     continue
 
-                # baricêntricas normalizadas
+                # Barycêntricas normalizadas
                 alpha = w0 * inv_area
                 beta  = w1 * inv_area
                 gamma = w2 * inv_area
 
-                # interpola z em NDC
+                # Interpola z em NDC
                 z_ndc = alpha*z0 + beta*z1 + gamma*z2
-                # mapeia para [0,1] igual ao OpenGL (near=-1 -> 0, far=+1 -> 1)
-                z_depth = (z_ndc + 1.0) * 0.5
+                z_depth = (z_ndc + 1.0) * 0.5  # mapeia [-1,1] para [0,1]
 
-                # lê z atual e compara
+                # Z-buffer
                 z_curr = gpu.GPU.read_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F)[0]
-                
-                # Para objetos transparentes, sempre renderiza sem atualizar z-buffer
-                # Para objetos opacos, só renderiza se estiver na frente
+
                 should_render = False
                 if transparency < 1.0:
-                    # Objeto transparente - sempre renderiza, mas não atualiza z-buffer
                     should_render = True
                 elif z_depth < z_curr:
-                    # Objeto opaco na frente - renderiza e atualiza z-buffer
                     should_render = True
                     gpu.GPU.draw_pixel([x, y], gpu.GPU.DEPTH_COMPONENT32F, [z_depth])
-                
+
                 if should_render:
-                    # Calcula cor final
-                    final_color = color
-                    
-                    # Interpolação de cor com correção de perspectiva
-                    if colors and w0_3d is not None and w1_3d is not None and w2_3d is not None:
-                        # Correção de perspectiva usando coordenadas W do espaço 3D
-                        alpha_corrected = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                        beta_corrected = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                        gamma_corrected = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                        
-                        # Interpola cores
-                        r = int(alpha_corrected * colors[0][0] + beta_corrected * colors[1][0] + gamma_corrected * colors[2][0])
-                        g = int(alpha_corrected * colors[0][1] + beta_corrected * colors[1][1] + gamma_corrected * colors[2][1])
-                        b = int(alpha_corrected * colors[0][2] + beta_corrected * colors[1][2] + gamma_corrected * colors[2][2])
-                        
-                        final_color = [max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))]
-                    
-                    # Aplicação de textura
+                    # Cor base (se não tiver nada, começa branco)
+                    final_color = color if color else [255, 255, 255]
+
+                    # Interpola cores se fornecidas
+                    if colors and w0_3d and w1_3d and w2_3d:
+                        alpha_c = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        beta_c  = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        gamma_c = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        r = int(alpha_c*colors[0][0] + beta_c*colors[1][0] + gamma_c*colors[2][0])
+                        g = int(alpha_c*colors[0][1] + beta_c*colors[1][1] + gamma_c*colors[2][1])
+                        b = int(alpha_c*colors[0][2] + beta_c*colors[1][2] + gamma_c*colors[2][2])
+                        final_color = [max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b))]
+
+                    # Aplica textura (fora do if de cores!)
                     if texture is not None and texcoords is not None:
-                        # Interpolação de coordenadas de textura com correção de perspectiva
-                        if w0_3d is not None and w1_3d is not None and w2_3d is not None:
-                            alpha_tex = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                            beta_tex = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
-                            gamma_tex = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                        if w0_3d and w1_3d and w2_3d:
+                            alpha_t = (alpha / w0_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                            beta_t  = (beta / w1_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
+                            gamma_t = (gamma / w2_3d) / ((alpha / w0_3d) + (beta / w1_3d) + (gamma / w2_3d))
                         else:
-                            alpha_tex, beta_tex, gamma_tex = alpha, beta, gamma
-                            
-                        # Interpola coordenadas de textura
-                        u = alpha_tex * texcoords[0][0] + beta_tex * texcoords[1][0] + gamma_tex * texcoords[2][0]
-                        v = alpha_tex * texcoords[0][1] + beta_tex * texcoords[1][1] + gamma_tex * texcoords[2][1]
-                        
-                        # Amostra textura
+                            alpha_t, beta_t, gamma_t = alpha, beta, gamma
+
+                        u = alpha_t*texcoords[0][0] + beta_t*texcoords[1][0] + gamma_t*texcoords[2][0]
+                        v = alpha_t*texcoords[0][1] + beta_t*texcoords[1][1] + gamma_t*texcoords[2][1]
                         tex_color = GL._sample_texture(texture, u, v)
+
                         if tex_color:
-                            # Multiplica cor base pela textura
-                            final_color = [
-                                int((final_color[0] / 255.0) * tex_color[0]),
-                                int((final_color[1] / 255.0) * tex_color[1]),
-                                int((final_color[2] / 255.0) * tex_color[2])
-                            ]
-                    
-                    # Aplicação de transparência (alpha blending)
+                            if GL.useLighting:
+                                # textura modula cor base
+                                final_color = [
+                                    int((final_color[0]/255.0)*tex_color[0]),
+                                    int((final_color[1]/255.0)*tex_color[1]),
+                                    int((final_color[2]/255.0)*tex_color[2])
+                                ]
+                            else:
+                                # só textura
+                                final_color = tex_color
+
+                    # Transparência (alpha blending simples)
                     if transparency < 1.0:
-                        # Lê cor atual do pixel
                         bg_color = gpu.GPU.read_pixel([x, y], gpu.GPU.RGB8)
                         if bg_color is not None:
-                            # Alpha blending: C_final = (1-transparency) * C_novo + transparency * C_antigo
-                            alpha_blend = 1.0 - transparency  # alpha é opacidade, não transparência
+                            alpha_blend = 1.0 - transparency
                             final_color = [
-                                int(alpha_blend * final_color[0] + transparency * bg_color[0]),
-                                int(alpha_blend * final_color[1] + transparency * bg_color[1]),
-                                int(alpha_blend * final_color[2] + transparency * bg_color[2])
+                                int(alpha_blend*final_color[0] + transparency*bg_color[0]),
+                                int(alpha_blend*final_color[1] + transparency*bg_color[1]),
+                                int(alpha_blend*final_color[2] + transparency*bg_color[2])
                             ]
-                    
+
                     gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, final_color)
+
 
 
     # ---------- Implementações principais ----------
